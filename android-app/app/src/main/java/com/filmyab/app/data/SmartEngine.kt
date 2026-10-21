@@ -700,11 +700,11 @@ object SmartEngine {
                             sleepQuiet(2000L)
                             return@use null // retry once on throttle
                         }
-                        return@use emptyList()
+                        return@use emptyList<WikiPage>()
                     }
-                    val bodyStr = resp.body?.string() ?: return@use emptyList()
+                    val bodyStr = resp.body?.string() ?: return@use emptyList<WikiPage>()
                     val root = JsonParser.parseString(bodyStr).asJsonObject
-                    val pages = root.getAsJsonArray("pages") ?: return@use emptyList()
+                    val pages = root.getAsJsonArray("pages") ?: return@use emptyList<WikiPage>()
                     val out = mutableListOf<WikiPage>()
                     for (el in pages) {
                         val o = el.takeIf { it.isJsonObject }?.asJsonObject ?: continue
