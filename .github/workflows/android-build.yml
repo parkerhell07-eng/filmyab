@@ -1,0 +1,64 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android-app/**"
+      - ".github/workflows/android-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build APKs (debug + release)
+        run: gradle -p android-app assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APKs
+        run: |
+          mkdir -p apks
+          cp android-app/app/build/outputs/apk/debug/app-debug.apk apks/FilmYab-v1.0-debug.apk
+          cp android-app/app/build/outputs/apk/release/app-release.apk apks/FilmYab-v1.0-release.apk
+          ls -la apks
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilmYab-APKs
+          path: apks/*.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: FilmYab v1.0.${{ github.run_number }}
+          body: |
+            🎬 **فیلم‌یاب** — نصب اندروید
+
+            | فایل | توضیح |
+            |---|---|
+            | `FilmYab-v1.0-debug.apk` | نسخه پیشنهادی برای نصب |
+            | `FilmYab-v1.0-release.apk` | نسخه release (امضا با کلید debug) |
+
+            **نصب:** فایل APK را دانلود و اجرا کنید؛ اگر اندروید پرسید، اجازه «نصب از منابع ناشناس» را بدهید.
+
+            **تنظیم سرور:** برای تحلیل کامل (فریم‌ها + هوش مصنوعی بینایی + جستجوی وب)، در تب «تنظیمات» برنامه آدرس سرور بک‌اند را وارد کنید. بدون سرور، حالت «تحلیل سریع روی دستگاه» به‌صورت خودکار کار می‌کند.
+          files: apks/*.apk
