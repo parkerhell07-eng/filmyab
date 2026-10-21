@@ -18,7 +18,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
-import java.io.IOException
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -73,8 +72,18 @@ object SmartEngine {
 
     private const val BROWSER_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+    /** Wikimedia throttles generic browser UAs from datacenter/VPN IPs — a descriptive
+     *  UA per their UA policy gets served reliably. */
+    private const val WIKI_UA = "FilmYabEngine/2.1 (Android; movie identification; contact: filmyab.app)"
     private const val POLLINATIONS_URL = "https://text.pollinations.ai/openai"
     private const val MAX_VIDEO_BYTES = 120L * 1024 * 1024
+
+    /** Identifies this app to the free AI gateway (raises anonymous quota). */
+    private const val REFERRER = "filmyab"
+
+    /** Free text models on the Classic API; first is the fastest/cheapest. */
+    private val LLM_MODELS = listOf("openai-fast", "openai")
 
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
@@ -156,28 +165,36 @@ object SmartEngine {
             onStep(STEP_ANALYZE, "skip")
         }
 
-        /* ---- 4. match: LLM candidates ---- */
+        /* ---- 4. match: smart candidates (AI + deterministic evidence path) ---- */
         onStep(STEP_MATCH, "start")
         val ai = askLlmCandidates(post, ocrText)
-        if (ai == null) {
+        val direct = directEvidenceCandidates(post, ocrText)
+        val merged = mergeCandidates(ai?.candidates ?: emptyList(), direct)
+        if (merged.isEmpty()) {
             onStep(STEP_MATCH, "error")
-            return@withContext Outcome.Fail("سرویس تحلیل هوشمند پاسخ نداد. چند لحظه بعد دوباره امتحان کن.")
-        }
-        if (ai.candidates.isEmpty()) {
-            onStep(STEP_MATCH, "error")
-            val extra = ai.sceneSummary?.let { " توضیح صحنه: $it" } ?: ""
+            if (ai != null) {
+                val extra = ai.sceneSummary?.let { " توضیح صحنه: $it" } ?: ""
+                return@withContext Outcome.Fail(
+                    "با شواهد موجود (کپشن و متن روی تصویر) نتونستم فیلمی رو با اطمینان پیدا کنم.$extra"
+                )
+            }
             return@withContext Outcome.Fail(
-                "با شواهد موجود (کپشن و متن روی تصویر) نتونستم فیلمی رو با اطمینان پیدا کنم.$extra"
+                "سرویس تحلیل هوشمند موقتاً محدود شده و از هشتگ‌ها و متن تصویر هم کاندیدی در پایگاه فیلم پیدا نشد. چند لحظه بعد دوباره امتحان کن."
             )
         }
         onStep(STEP_MATCH, "done")
+        val effective = AiAnalysis(
+            found = merged.isNotEmpty(),
+            sceneSummary = ai?.sceneSummary,
+            candidates = merged
+        )
 
         /* ---- 5. verify: Wikipedia ---- */
         onStep(STEP_VERIFY, "start")
-        val verified = verifyCandidates(ai.candidates, post, ocrText)
+        val verified = verifyCandidates(effective.candidates, post, ocrText)
         if (verified.isEmpty()) {
             onStep(STEP_VERIFY, "error")
-            val names = ai.candidates.joinToString("، ") { it.name ?: "?" }
+            val names = effective.candidates.joinToString("، ") { it.name ?: "?" }
             return@withContext Outcome.Fail(
                 "کاندیدها ($names) در پایگاه فیلم تأیید نشدند. احتمالاً کلیپ از فیلم شناخته‌شده‌ای نیست یا شواهد کم است."
             )
@@ -187,9 +204,9 @@ object SmartEngine {
         /* ---- 6. final ---- */
         onStep(STEP_FINAL, "start")
         val best = verified.first()
-        var result = buildFinal(best, verified.drop(1), ai, post, ocrText)
+        var result = buildFinal(best, verified.drop(1), effective, post, ocrText)
         if (best.score < 0.85) {
-            val fused = askLlmFusion(verified, ai, post, ocrText)
+            val fused = askLlmFusion(verified, effective, post, ocrText)
             if (fused != null) {
                 result = blend(result, fused)
             }
@@ -314,19 +331,39 @@ object SmartEngine {
 
     /* ================= LLM channel (keyless) ================= */
 
-    private fun callLlm(system: String, user: String): String? {
-        val delaysMs = longArrayOf(0, 3000, 8000)
-        for (attempt in delaysMs.indices) {
-            if (delaysMs[attempt] > 0) {
-                try {
-                    Thread.sleep(delaysMs[attempt])
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
-            }
+    /**
+     * Bulletproof keyless LLM channel.
+     *
+     * Why this exists: the free gateway enforces "1 fresh reply every 30 seconds per
+     * IP" — on a shared VPN exit IP nearly every first call returns 402/429, and
+     * Cloudflare may answer with an HTML challenge. The old code aborted on any
+     * non-IO exception (parse errors!) after 3 short retries, which surfaced as
+     * "سرویس تحلیل هوشمند پاسخ نداد".
+     *
+     * Fixes:
+     *  - 402/429 → wait politely (Retry-After honored, default 31s) up to
+     *    [maxRateLimitWaits] times, then retry the SAME payload (server cache hits).
+     *  - tolerant parsing via [extractLlmContent]; HTML/error pages are retries, not
+     *    fatal; parse errors never break the loop.
+     *  - model rotation on hard failures (openai-fast → openai).
+     *  - `referrer` sent for higher anonymous quota.
+     *  - hard wall-clock [totalBudgetMs] so the pipeline always terminates.
+     */
+    private fun callLlm(
+        system: String,
+        user: String,
+        maxRateLimitWaits: Int = 2,
+        totalBudgetMs: Long = 150_000L
+    ): String? {
+        val deadline = System.currentTimeMillis() + totalBudgetMs
+        var rateWaits = 0
+        var hardFails = 0
+        while (System.currentTimeMillis() < deadline) {
+            val model = LLM_MODELS[hardFails % LLM_MODELS.size]
             try {
                 val payload = JsonObject()
-                payload.addProperty("model", "openai")
+                payload.addProperty("model", model)
+                payload.addProperty("referrer", REFERRER)
                 val sys = JsonObject()
                 sys.addProperty("role", "system")
                 sys.addProperty("content", system)
@@ -340,26 +377,83 @@ object SmartEngine {
                 payload.addProperty("temperature", 0.2)
 
                 val request = Request.Builder()
-                    .url(POLLINATIONS_URL)
+                    .url("$POLLINATIONS_URL?referrer=$REFERRER")
                     .header("Accept", "application/json")
                     .post(payload.toString().toRequestBody("application/json".toMediaType()))
                     .build()
                 http.newCall(request).execute().use { resp ->
-                    if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
-                    val bodyStr = resp.body?.string() ?: throw IOException("empty body")
-                    val root = JsonParser.parseString(bodyStr).asJsonObject
-                    val choices = root.getAsJsonArray("choices") ?: throw IOException("no choices")
-                    if (choices.size() == 0) throw IOException("empty choices")
-                    val message = choices.get(0).asJsonObject.getAsJsonObject("message")
-                        ?: throw IOException("no message")
-                    val content = message.get("content")
-                    if (content == null || content.isJsonNull) throw IOException("no content")
-                    return content.asString
+                    when {
+                        resp.code == 402 || resp.code == 429 -> {
+                            if (rateWaits >= maxRateLimitWaits) return null
+                            rateWaits++
+                            val ra = resp.header("Retry-After")?.trim()?.toLongOrNull()
+                            sleepQuiet((ra ?: 30L).coerceIn(5L, 40L) * 1000L + 1500L)
+                        }
+                        resp.code >= 500 -> {
+                            hardFails++
+                            sleepQuiet(4000L)
+                        }
+                        !resp.isSuccessful -> {
+                            hardFails++
+                            sleepQuiet(1200L)
+                        }
+                        else -> {
+                            val bodyStr = resp.body?.string() ?: ""
+                            val content = extractLlmContent(bodyStr)
+                            if (content != null && content.contains('{') && content.contains('}')) {
+                                return content
+                            }
+                            hardFails++
+                            sleepQuiet(1200L)
+                        }
+                    }
                 }
-            } catch (e: IOException) {
-                // network/HTTP failure — retry with backoff
             } catch (e: Exception) {
-                break
+                hardFails++
+                sleepQuiet(2500L)
+            }
+        }
+        return null
+    }
+
+    private fun sleepQuiet(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    /**
+     * Tolerant LLM reply parser: OpenAI chat shape, legacy completions shape, or a
+     * top-level content field. HTML challenge pages and plain error texts return null
+     * so the caller retries instead of crashing.
+     */
+    private fun extractLlmContent(body: String): String? {
+        val trimmed = body.trim()
+        if (trimmed.length < 2) return null
+        val lower = trimmed.lowercase(Locale.US)
+        if (lower.startsWith("<!doctype") || lower.startsWith("<html") ||
+            lower.contains("just a moment") || lower.contains("cloudflare")
+        ) {
+            return null
+        }
+        if (trimmed.startsWith("{")) {
+            return try {
+                val root = JsonParser.parseString(trimmed).asJsonObject
+                val choices = root.getAsJsonArray("choices")
+                if (choices != null && choices.size() > 0) {
+                    val c0 = choices.get(0).takeIf { it.isJsonObject }?.asJsonObject
+                    val msg = c0?.getAsJsonObject("message")
+                    (msg?.get("content")?.takeIf { !it.isJsonNull }?.asString
+                        ?: c0?.get("text")?.takeIf { !it.isJsonNull }?.asString)
+                        ?.trim()?.takeIf { it.isNotEmpty() }
+                } else {
+                    root.get("content")?.takeIf { !it.isJsonNull }?.asString
+                        ?.trim()?.takeIf { it.isNotEmpty() }
+                }
+            } catch (e: Exception) {
+                null
             }
         }
         return null
@@ -422,9 +516,10 @@ object SmartEngine {
             "credits, character names and subtitle phrases found by OCR. " +
             "Reply ONLY with minified JSON, no markdown, exactly this schema: " +
             "{\"scene_summary_fa\":\"یک جمله کوتاه فارسی درباره صحنه\"," +
-            "\"candidates\":[{\"title\":\"original English title\",\"year\":\"\",\"reason_fa\":\"دلیل کوتاه فارسی\"}]," +
+            "\"candidates\":[{\"title\":\"original English title\",\"year\":\"\",\"confidence\":0.0,\"reason_fa\":\"دلیل کوتاه فارسی\"}]," +
             "\"found\":true}. " +
-            "Rules: at most 3 candidates ordered by likelihood; year=\"\" if unsure; " +
+            "Rules: at most 3 candidates ordered by likelihood; confidence is 0..1 and reflects your " +
+            "certainty for each candidate; year=\"\" if unsure; " +
             "if the evidence is too weak to name any movie, set found=false and candidates=[]."
 
     private fun askLlmCandidates(post: InstagramPost, ocrText: String): AiAnalysis? {
@@ -466,65 +561,207 @@ object SmartEngine {
         )
     }
 
+    /* ---- step 4b: deterministic evidence path (works even without the AI service) ---- */
+
+    /** Hashtags that describe the platform/format, not a movie — never used as queries. */
+    private val GENERIC_TAGS = setOf(
+        "movie", "movies", "film", "films", "cinema", "reel", "reels", "instagram",
+        "viral", "explore", "trending", "hollywood", "bollywood", "trailer", "clip",
+        "scene", "scenes", "edit", "edits", "shorts", "video", "videos", "fyp", "foryou",
+        "actor", "actress", "love", "follow", "like", "dubbed", "netflix", "series",
+        "movieclip", "movieclips", "filmclip", "newmovie", "fullmovie", "hd", "4k",
+        "subscribe", "share", "comment", "explorepage", "instagood", "reelsvideo",
+        "reelsinstagram", "trendingreels", "viralreels", "capcut", "status", "whatsapp"
+    )
+
+    private val ogTitleNoiseRegex =
+        Regex("""^\s*(?:[\d.,]+[KkMm]?\s+likes?,\s*[\d.,]+\s+comments?\s*-\s*)?[^:\n]{0,60}on Instagram:\s*""")
+
+    /** "TheShawshankRedemption" → "The Shawshank Redemption". */
+    private fun splitCamelCase(s: String): String =
+        s.replace(Regex("([a-z])([A-Z])"), "$1 $2")
+            .replace(Regex("([A-Za-z])(\\d)"), "$1 $2")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    /** og:title → most query-worthy fragment ("Name on Instagram: caption…" → "caption…"). */
+    private fun cleanOgTitleForQuery(t: String): String? {
+        var s = t.replace(Regex("""\s*[•|]\s*Instagram\s*$"""), "").trim()
+        val m = ogTitleNoiseRegex.find(s)
+        if (m != null) s = s.substring(m.value.length).trim()
+        if (s.length > 80) s = s.take(80).trim()
+        return s.takeIf { it.length >= 4 }
+    }
+
+    /**
+     * Deterministic, keyless candidate finder that never depends on the AI service:
+     * it turns the strongest signals of the post (page title, hashtags, caption lines,
+     * OCR title cards) into Wikipedia film searches. Results are verified again later
+     * by [verifyCandidates], so false hits get filtered with hard evidence.
+     */
+    private fun directEvidenceCandidates(post: InstagramPost, ocrText: String): List<Candidate> {
+        val queries = LinkedHashSet<String>()
+
+        post.ogTitle?.let { t -> cleanOgTitleForQuery(t)?.let { queries.add(it) } }
+
+        for (tag in post.hashtags.take(10)) {
+            val base = tag.removePrefix("#").trim()
+            if (base.length < 3 || base.lowercase(Locale.US) in GENERIC_TAGS) continue
+            val spaced = base.replace('_', ' ').replace('-', ' ').replace('.', ' ')
+                .replace(Regex("\\s+"), " ").trim()
+            queries.add(splitCamelCase(spaced))
+        }
+
+        post.caption?.take(400)?.split("\n")?.forEach { raw ->
+            val t = raw.trim()
+            val letters = t.count { it.isLetter() }
+            if (t.length in 4..60 && letters >= 4 && letters >= t.length * 0.6) {
+                queries.add(t)
+            }
+        }
+
+        if (ocrText.isNotBlank()) {
+            ocrText.split(" | ").forEach { raw ->
+                val t = raw.trim()
+                val letters = t.count { it.isLetter() }
+                if (t.length in 4..70 && letters >= 4 && letters >= t.length * 0.5) {
+                    queries.add(t)
+                }
+            }
+        }
+
+        val out = mutableListOf<Candidate>()
+        val seenTitles = mutableSetOf<String>()
+        for (q in queries.take(8)) {
+            if (out.size >= 4) break
+            val lang = if (persianRegex.containsMatchIn(q)) "fa" else "en"
+            val pages = try {
+                wikiSearch(lang, q, 5)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            if (pages.isEmpty()) continue
+            val filmPages = pages.filter { looksLikeFilmDescription(it.description) }
+            val exact = pages.firstOrNull { normalizedKey(it.title) == normalizedKey(q) }
+            val chosen = (filmPages + listOfNotNull(exact)).distinctBy { it.key }.take(2)
+            for (p in chosen) {
+                val key = normalizedKey(p.title)
+                if (key.isEmpty() || seenTitles.contains(key)) continue
+                seenTitles.add(key)
+                out.add(
+                    Candidate(
+                        name = p.title,
+                        year = p.description?.let { yearRegex.find(it)?.value },
+                        confidence = 0.5,
+                        reason = "از نشانه‌های خود پست (هشتگ/عنوان/متن تصویر) در پایگاه فیلم پیدا شد"
+                    )
+                )
+            }
+        }
+        return out
+    }
+
+    /** LLM candidates first, then unique evidence-path candidates, capped at 5. */
+    private fun mergeCandidates(llm: List<Candidate>, direct: List<Candidate>): List<Candidate> {
+        val out = mutableListOf<Candidate>()
+        val seen = mutableSetOf<String>()
+        for (c in llm + direct) {
+            val name = c.name ?: continue
+            val key = normalizedKey(name)
+            if (key.isEmpty() || seen.contains(key)) continue
+            seen.add(key)
+            out.add(c)
+            if (out.size >= 5) break
+        }
+        return out
+    }
+
     /* ---- step 5: Wikipedia verification (keyless) ---- */
 
     private data class WikiPage(
+        val lang: String,
         val key: String,
         val title: String,
         val description: String?
     )
 
     private fun wikiSearch(lang: String, query: String, limit: Int): List<WikiPage> {
-        return try {
-            val q = URLEncoder.encode(query, "UTF-8")
-            val req = Request.Builder()
-                .url("https://$lang.wikipedia.org/w/rest.php/v1/search/title?q=$q&limit=$limit")
-                .header("User-Agent", BROWSER_UA)
-                .header("Accept", "application/json")
-                .build()
-            http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use emptyList()
-                val bodyStr = resp.body?.string() ?: return@use emptyList()
-                val root = JsonParser.parseString(bodyStr).asJsonObject
-                val pages = root.getAsJsonArray("pages") ?: return@use emptyList()
-                val out = mutableListOf<WikiPage>()
-                for (el in pages) {
-                    val o = el.takeIf { it.isJsonObject }?.asJsonObject ?: continue
-                    val key = optString(o, "key") ?: continue
-                    val title = optString(o, "title") ?: key
-                    out.add(WikiPage(key, title, optString(o, "description")))
+        val q = URLEncoder.encode(query, "UTF-8")
+        repeat(2) { attempt ->
+            try {
+                val req = Request.Builder()
+                    .url("https://$lang.wikipedia.org/w/rest.php/v1/search/title?q=$q&limit=$limit")
+                    .header("User-Agent", WIKI_UA)
+                    .header("Accept", "application/json")
+                    .build()
+                http.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        if (attempt == 0 && resp.code == 429) {
+                            sleepQuiet(2000L)
+                            return@use null // retry once on throttle
+                        }
+                        return@use emptyList()
+                    }
+                    val bodyStr = resp.body?.string() ?: return@use emptyList()
+                    val root = JsonParser.parseString(bodyStr).asJsonObject
+                    val pages = root.getAsJsonArray("pages") ?: return@use emptyList()
+                    val out = mutableListOf<WikiPage>()
+                    for (el in pages) {
+                        val o = el.takeIf { it.isJsonObject }?.asJsonObject ?: continue
+                        val key = optString(o, "key") ?: continue
+                        val title = optString(o, "title") ?: key
+                        out.add(WikiPage(lang, key, title, optString(o, "description")))
+                    }
+                    return out
                 }
-                out
+            } catch (e: Exception) {
+                if (attempt == 1) return emptyList()
+                sleepQuiet(2000L)
             }
-        } catch (e: Exception) {
-            emptyList()
         }
+        return emptyList()
     }
 
     private fun wikiSummary(lang: String, key: String): JsonObject? {
-        return try {
-            val encoded = URLEncoder.encode(key, "UTF-8").replace("+", "%20")
-            val req = Request.Builder()
-                .url("https://$lang.wikipedia.org/api/rest_v1/page/summary/$encoded")
-                .header("User-Agent", BROWSER_UA)
-                .header("Accept", "application/json")
-                .build()
-            http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use null
-                val bodyStr = resp.body?.string() ?: return@use null
-                JsonParser.parseString(bodyStr).asJsonObject
+        val encoded = URLEncoder.encode(key, "UTF-8").replace("+", "%20")
+        repeat(2) { attempt ->
+            try {
+                val req = Request.Builder()
+                    .url("https://$lang.wikipedia.org/api/rest_v1/page/summary/$encoded")
+                    .header("User-Agent", WIKI_UA)
+                    .header("Accept", "application/json")
+                    .build()
+                http.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        if (attempt == 0 && resp.code == 429) {
+                            sleepQuiet(2000L)
+                            return@use null // retry once on throttle
+                        }
+                        return@use null
+                    }
+                    val bodyStr = resp.body?.string() ?: return@use null
+                    return JsonParser.parseString(bodyStr).asJsonObject
+                }
+            } catch (e: Exception) {
+                if (attempt == 1) return null
+                sleepQuiet(2000L)
             }
-        } catch (e: Exception) {
-            null
         }
+        return null
     }
 
     private val filmDescRegex = Regex("""(?i)\b(film|movie|series|television|miniseries)\b""")
     private val yearRegex = Regex("""(19|20)\d{2}""")
     private val directorRegex = Regex("""\bby ([A-Z][^,.;()]{2,40})""")
+    private val persianRegex = Regex("""[\u0600-\u06FF]""")
+
+    private fun looksLikeFilmDescription(description: String?): Boolean {
+        val d = description ?: return false
+        return filmDescRegex.containsMatchIn(d) || d.contains("فیلم") || d.contains("سریال")
+    }
 
     private fun buildWikiEvidence(page: WikiPage): WikiEvidence? {
-        val summary = wikiSummary("en", page.key) ?: return null
+        val summary = wikiSummary(page.lang, page.key) ?: return null
         val description = optString(summary, "description")
         val extract = optString(summary, "extract") ?: ""
         val hay = listOfNotNull(description, extract.take(400)).joinToString(" ")
@@ -548,13 +785,17 @@ object SmartEngine {
 
         // Persian title: search fa-wiki with the english title, accept entries about films
         var faTitle: String? = null
-        val faPages = wikiSearch("fa", page.title, 3)
-        for (fp in faPages) {
-            val d = fp.description ?: ""
-            if (d.contains("فیلم") || d.contains("سریال")) {
-                faTitle = fp.title
-                break
+        if (page.lang == "en") {
+            val faPages = wikiSearch("fa", page.title, 3)
+            for (fp in faPages) {
+                val d = fp.description ?: ""
+                if (d.contains("فیلم") || d.contains("سریال")) {
+                    faTitle = fp.title
+                    break
+                }
             }
+        } else {
+            faTitle = page.title
         }
 
         return WikiEvidence(
@@ -577,31 +818,38 @@ object SmartEngine {
         val out = mutableListOf<VerifiedCandidate>()
         val seen = mutableSetOf<String>()
         for (c in candidates) {
-            if (out.size >= 3) break
+            if (out.size >= 4) break
             val title = c.name ?: continue
             val key = normalizedKey(title)
             if (key.isEmpty() || seen.contains(key)) continue
             seen.add(key)
 
-            val pages = wikiSearch("en", title, 5)
-            var chosen: WikiPage? = null
-            for (p in pages) {
-                val d = p.description ?: ""
-                if (filmDescRegex.containsMatchIn(d) || d.contains("فیلم")) {
-                    chosen = p
-                    break
+            val wiki: WikiEvidence?
+            if (persianRegex.containsMatchIn(title)) {
+                // Persian candidate (from fa hashtags/caption) — verify on fa-wiki directly
+                val pages = wikiSearch("fa", title, 5)
+                val chosen = pages.firstOrNull { looksLikeFilmDescription(it.description) }
+                    ?: pages.firstOrNull { normalizedKey(it.title) == key }
+                wiki = chosen?.let { buildWikiEvidence(it) }
+            } else {
+                val pages = wikiSearch("en", title, 5)
+                var chosen: WikiPage? = null
+                for (p in pages) {
+                    if (looksLikeFilmDescription(p.description)) {
+                        chosen = p
+                        break
+                    }
                 }
+                if (chosen == null) {
+                    chosen = pages.firstOrNull { normalizedKey(it.title) == key }
+                }
+                if (chosen == null) {
+                    // try a sharper query "title film"
+                    chosen = wikiSearch("en", "$title film", 4)
+                        .firstOrNull { looksLikeFilmDescription(it.description) }
+                }
+                wiki = chosen?.let { buildWikiEvidence(it) }
             }
-            if (chosen == null) {
-                chosen = pages.firstOrNull { normalizedKey(it.title) == key }
-            }
-            if (chosen == null) {
-                // try a sharper query "title film"
-                chosen = wikiSearch("en", "$title film", 4)
-                    .firstOrNull { filmDescRegex.containsMatchIn(it.description ?: "") }
-            }
-
-            val wiki = chosen?.let { buildWikiEvidence(it) }
             val score = scoreCandidate(c, post, ocrText, wiki)
             if (wiki != null || score >= 0.5) {
                 out.add(VerifiedCandidate(c, wiki, score))
@@ -736,7 +984,11 @@ object SmartEngine {
             sb.append(" | engine score=").append(String.format(Locale.US, "%.2f", v.score))
             sb.append("\n")
         }
-        val content = callLlm(FUSION_SYSTEM, sb.toString()) ?: return null
+        val content = callLlm(
+            FUSION_SYSTEM, sb.toString(),
+            maxRateLimitWaits = 1,
+            totalBudgetMs = 70_000L
+        ) ?: return null
         val obj = extractJson(content) ?: return null
         val genres = mutableListOf<String>()
         val g = obj.get("genres")
