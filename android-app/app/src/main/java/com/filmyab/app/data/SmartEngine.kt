@@ -315,8 +315,15 @@ object SmartEngine {
     /* ================= LLM channel (keyless) ================= */
 
     private fun callLlm(system: String, user: String): String? {
-        var lastError: Exception? = null
-        for (attempt in 0 until 2) {
+        val delaysMs = longArrayOf(0, 3000, 8000)
+        for (attempt in delaysMs.indices) {
+            if (delaysMs[attempt] > 0) {
+                try {
+                    Thread.sleep(delaysMs[attempt])
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
             try {
                 val payload = JsonObject()
                 payload.addProperty("model", "openai")
@@ -350,9 +357,8 @@ object SmartEngine {
                     return content.asString
                 }
             } catch (e: IOException) {
-                lastError = e
+                // network/HTTP failure — retry with backoff
             } catch (e: Exception) {
-                lastError = e
                 break
             }
         }

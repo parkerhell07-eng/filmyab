@@ -241,18 +241,21 @@ object InstagramScraper {
         return og
     }
 
-    /** og:description looks like: "username on February 9, 2025: caption text". */
+    /** og:description looks like: "username on February 9, 2025: caption text" (sometimes
+     *  prefixed with "27K likes, 37 comments - " on popular posts). */
     private val ogDescPrefixRegex =
-        Regex("""^[A-Za-z0-9._]+ on [A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*""")
+        Regex("""^.*?on [A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*""")
     private val ogOwnerRegex =
-        Regex("""^([A-Za-z0-9._]+) on [A-Za-z]+\s+\d{1,2},\s+\d{4}:""")
+        Regex("""([A-Za-z0-9._]+) on [A-Za-z]+\s+\d{1,2},\s+\d{4}:""")
 
-    private fun captionFromOgDescription(desc: String): String? =
-        ogDescPrefixRegex.find(desc)?.let { desc.substring(it.value.length).trim().takeIf { s -> s.isNotEmpty() } }
-            ?: desc.trim().takeIf { it.isNotEmpty() }
+    private fun captionFromOgDescription(desc: String): String? {
+        val stripped = ogDescPrefixRegex.find(desc)?.let { desc.substring(it.value.length).trim() } ?: desc.trim()
+        return stripped.takeIf { it.isNotEmpty() }
+    }
 
     private fun ownerFromOgDescription(desc: String): String? =
-        ogOwnerRegex.find(desc)?.groupValues?.get(1)?.takeIf { it.isNotBlank() && it != "Instagram" }
+        ogOwnerRegex.find(desc.take(100))?.groupValues?.get(1)
+            ?.takeIf { it.isNotBlank() && it != "Instagram" }
 
     /** og:title looks like: "Account Name on Instagram: caption..." — used only as caption fallback. */
     private val ogTitlePrefixRegex = Regex("""^[^:]*on Instagram:\s*""")

@@ -153,8 +153,8 @@ function extractBestVideoUrl(html: string): string | null {
   );
 }
 
-const OG_DESC_PREFIX = /^[\w.\-]+ on [A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*/;
-const OG_OWNER = /^([\w.\-]+) on [A-Za-z]+\s+\d{1,2},\s+\d{4}:/;
+const OG_DESC_PREFIX = /^.*?on [A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*/;
+const OG_OWNER = /([\w.\-]+) on [A-Za-z]+\s+\d{1,2},\s+\d{4}:/;
 
 function ogMeta(html: string, prop: string): string | null {
   const re = new RegExp(
@@ -177,7 +177,7 @@ async function fetchViaCrawler(shortcode: string): Promise<Partial<InstagramPost
 
   const title = ogMeta(html, "og:title");
   const description = ogMeta(html, "og:description");
-  const ownerMatch = description?.match(OG_OWNER);
+  const ownerMatch = description?.slice(0, 100)?.match(OG_OWNER);
   const caption = (description ?? title ?? null)?.replace(OG_DESC_PREFIX, "");
 
   const out: Partial<InstagramPostData> = {
