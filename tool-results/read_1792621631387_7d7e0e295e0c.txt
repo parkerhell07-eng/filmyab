@@ -1,0 +1,822 @@
+     1→     1→package com.filmyab.app.data
+     2→     2→
+     3→     3→import android.content.Context
+     4→     4→import android.graphics.Bitmap
+     5→     5→import android.media.MediaMetadataRetriever
+     6→     6→import com.google.gson.JsonArray
+     7→     7→import com.google.gson.JsonObject
+     8→     8→import com.google.gson.JsonParser
+     9→     9→import com.google.mlkit.vision.common.InputImage
+    10→    10→import com.google.mlkit.vision.text.Text
+    11→    11→import com.google.mlkit.vision.text.TextRecognition
+    12→    12→import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+    13→    13→import kotlinx.coroutines.Dispatchers
+    14→    14→import kotlinx.coroutines.tasks.await
+    15→    15→import kotlinx.coroutines.withContext
+    16→    16→import okhttp3.MediaType.Companion.toMediaType
+    17→    17→import okhttp3.OkHttpClient
+    18→    18→import okhttp3.Request
+    19→    19→import okhttp3.RequestBody.Companion.toRequestBody
+    20→    20→import java.io.File
+    21→    21→import java.io.IOException
+    22→    22→import java.net.URLEncoder
+    23→    23→import java.util.Locale
+    24→    24→import java.util.concurrent.TimeUnit
+    25→    25→
+    26→    26→/**
+    27→    27→ * FilmYab v2 on-device SMART ENGINE (no server, no keys, no settings).
+    28→    28→ *
+    29→    29→ * Pipeline:
+    30→    30→ *  1. net     — automatic VPN/connectivity check (Instagram + internet reachability)
+    31→    31→ *  2. fetch   — scrape the Instagram post on device (crawler-UA page, embed, __a=1, og)
+    32→    32→ *  3. analyze — download the video to cache, sample 3 frames (MediaMetadataRetriever),
+    33→    33→ *               read on-screen text with on-device OCR (ML Kit, bundled latin model)
+    34→    34→ *  4. match   — keyless text LLM (Pollinations) turns caption/hashtags/OCR/og-title
+    35→    35→ *               into ranked movie candidates
+    36→    36→ *  5. verify  — each candidate is verified against Wikipedia REST (keyless): title,
+    37→    37→ *               year, director, description, poster
+    38→    38→ *  6. final   — self-built scoring blends LLM confidence with concrete evidence
+    39→    39→ *               (wiki confirmation, og-title hit, hashtag hit, OCR hit); a second
+    40→    40→ *               LLM pass fuses everything when the score is not decisive.
+    41→    41→ */
+    42→    42→object SmartEngine {
+    43→    43→
+    44→    44→    /* ---------------- step keys ---------------- */
+    45→    45→    const val STEP_NET = "net"
+    46→    46→    const val STEP_FETCH = "fetch"
+    47→    47→    const val STEP_ANALYZE = "analyze"
+    48→    48→    const val STEP_MATCH = "match"
+    49→    49→    const val STEP_VERIFY = "verify"
+    50→    50→    const val STEP_FINAL = "final"
+    51→    51→
+    52→    52→    sealed class Outcome {
+    53→    53→        data class Done(val result: SmartResult) : Outcome()
+    54→    54→        data class Fail(val message: String, val needVpn: Boolean = false) : Outcome()
+    55→    55→    }
+    56→    56→
+    57→    57→    private data class AiAnalysis(
+    58→    58→        val found: Boolean,
+    59→    59→        val sceneSummary: String?,
+    60→    60→        val candidates: List<Candidate>
+    61→    61→    )
+    62→    62→
+    63→    63→    private data class Fused(
+    64→    64→        val found: Boolean,
+    65→    65→        val titleEn: String?,
+    66→    66→        val titleFa: String?,
+    67→    67→        val year: String?,
+    68→    68→        val director: String?,
+    69→    69→        val genres: List<String>,
+    70→    70→        val confidence: Double,
+    71→    71→        val reasoningFa: String?
+    72→    72→    )
+    73→    73→
+    74→    74→    private const val BROWSER_UA =
+    75→    75→        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    76→    76→    private const val POLLINATIONS_URL = "https://text.pollinations.ai/openai"
+    77→    77→    private const val MAX_VIDEO_BYTES = 120L * 1024 * 1024
+    78→    78→
+    79→    79→    private val http: OkHttpClient = OkHttpClient.Builder()
+    80→    80→        .connectTimeout(12, TimeUnit.SECONDS)
+    81→    81→        .readTimeout(120, TimeUnit.SECONDS)
+    82→    82→        .writeTimeout(30, TimeUnit.SECONDS)
+    83→    83→        .followRedirects(true)
+    84→    84→        .build()
+    85→    85→
+    86→    86→    private val quickHttp: OkHttpClient = OkHttpClient.Builder()
+    87→    87→        .connectTimeout(6, TimeUnit.SECONDS)
+    88→    88→        .readTimeout(6, TimeUnit.SECONDS)
+    89→    89→        .build()
+    90→    90→
+    91→    91→    /* ================= 1. connectivity ================= */
+    92→    92→
+    93→    93→    suspend fun checkNetwork(): NetState = withContext(Dispatchers.IO) {
+    94→    94→        val instagram = reachable("https://www.instagram.com/robots.txt")
+    95→    95→        val internet = instagram ||
+    96→    96→            reachable("https://www.gstatic.com/generate_204") ||
+    97→    97→            reachable("https://en.wikipedia.org/w/rest.php/v1/search/title?q=a&limit=1")
+    98→    98→        when {
+    99→    99→            instagram -> NetState("ok", instagramOk = true, internetOk = true)
+   100→   100→            internet -> NetState("vpn_needed", instagramOk = false, internetOk = true)
+   101→   101→            else -> NetState("offline", instagramOk = false, internetOk = false)
+   102→   102→        }
+   103→   103→    }
+   104→   104→
+   105→   105→    private fun reachable(url: String): Boolean = try {
+   106→   106→        val req = Request.Builder()
+   107→   107→            .url(url)
+   108→   108→            .header("User-Agent", BROWSER_UA)
+   109→   109→            .build()
+   110→   110→        quickHttp.newCall(req).execute().use { it.isSuccessful || it.code in listOf(301, 302, 403, 429) }
+   111→   111→    } catch (e: Exception) {
+   112→   112→        false
+   113→   113→    }
+   114→   114→
+   115→   115→    /* ================= 2..6 pipeline ================= */
+   116→   116→
+   117→   117→    suspend fun identify(
+   118→   118→        appContext: Context,
+   119→   119→        rawUrl: String,
+   120→   120→        onStep: (String, String) -> Unit
+   121→   121→    ): Outcome = withContext(Dispatchers.IO) {
+   122→   122→
+   123→   123→        /* ---- 1. net ---- */
+   124→   124→        onStep(STEP_NET, "start")
+   125→   125→        val net = checkNetwork()
+   126→   126→        onStep(STEP_NET, if (net.internetOk || net.instagramOk) "done" else "error")
+   127→   127→        if (!net.internetOk) {
+   128→   128→            return@withContext Outcome.Fail("اینترنت در دسترس نیست. اتصال شبکه یا فیلترشکن را بررسی کنید.")
+   129→   129→        }
+   130→   130→
+   131→   131→        /* ---- 2. fetch ---- */
+   132→   132→        onStep(STEP_FETCH, "start")
+   133→   133→        val post = InstagramScraper.fetchPost(rawUrl)
+   134→   134→        if (post == null) {
+   135→   135→            onStep(STEP_FETCH, "error")
+   136→   136→            return@withContext Outcome.Fail(
+   137→   137→                "اینستاگرام اجازه خواندن این پست را نداد. اگر فیلترشکن داری روشنش کن، چند لحظه صبر کن و دوباره تلاش کن. (پست باید عمومی باشد)",
+   138→   138→                needVpn = !net.instagramOk
+   139→   139→            )
+   140→   140→        }
+   141→   141→        onStep(STEP_FETCH, "done")
+   142→   142→
+   143→   143→        /* ---- 3. analyze: frames + OCR ---- */
+   144→   144→        onStep(STEP_ANALYZE, "start")
+   145→   145→        var ocrText = ""
+   146→   146→        val videoUrl = post.videoUrl
+   147→   147→        if (videoUrl != null) {
+   148→   148→            val frames = extractFrames(appContext, videoUrl, 3)
+   149→   149→            if (frames.isNotEmpty()) {
+   150→   150→                ocrText = runOcr(frames)
+   151→   151→                onStep(STEP_ANALYZE, "done")
+   152→   152→            } else {
+   153→   153→                onStep(STEP_ANALYZE, "skip")
+   154→   154→            }
+   155→   155→        } else {
+   156→   156→            onStep(STEP_ANALYZE, "skip")
+   157→   157→        }
+   158→   158→
+   159→   159→        /* ---- 4. match: LLM candidates ---- */
+   160→   160→        onStep(STEP_MATCH, "start")
+   161→   161→        val ai = askLlmCandidates(post, ocrText)
+   162→   162→        if (ai == null) {
+   163→   163→            onStep(STEP_MATCH, "error")
+   164→   164→            return@withContext Outcome.Fail("سرویس تحلیل هوشمند پاسخ نداد. چند لحظه بعد دوباره امتحان کن.")
+   165→   165→        }
+   166→   166→        if (ai.candidates.isEmpty()) {
+   167→   167→            onStep(STEP_MATCH, "error")
+   168→   168→            val extra = ai.sceneSummary?.let { " توضیح صحنه: $it" } ?: ""
+   169→   169→            return@withContext Outcome.Fail(
+   170→   170→                "با شواهد موجود (کپشن و متن روی تصویر) نتونستم فیلمی رو با اطمینان پیدا کنم.$extra"
+   171→   171→            )
+   172→   172→        }
+   173→   173→        onStep(STEP_MATCH, "done")
+   174→   174→
+   175→   175→        /* ---- 5. verify: Wikipedia ---- */
+   176→   176→        onStep(STEP_VERIFY, "start")
+   177→   177→        val verified = verifyCandidates(ai.candidates, post, ocrText)
+   178→   178→        if (verified.isEmpty()) {
+   179→   179→            onStep(STEP_VERIFY, "error")
+   180→   180→            val names = ai.candidates.joinToString("، ") { it.name ?: "?" }
+   181→   181→            return@withContext Outcome.Fail(
+   182→   182→                "کاندیدها ($names) در پایگاه فیلم تأیید نشدند. احتمالاً کلیپ از فیلم شناخته‌شده‌ای نیست یا شواهد کم است."
+   183→   183→            )
+   184→   184→        }
+   185→   185→        onStep(STEP_VERIFY, "done")
+   186→   186→
+   187→   187→        /* ---- 6. final ---- */
+   188→   188→        onStep(STEP_FINAL, "start")
+   189→   189→        val best = verified.first()
+   190→   190→        var result = buildFinal(best, verified.drop(1), ai, post, ocrText)
+   191→   191→        if (best.score < 0.85) {
+   192→   192→            val fused = askLlmFusion(verified, ai, post, ocrText)
+   193→   193→            if (fused != null) {
+   194→   194→                result = blend(result, fused)
+   195→   195→            }
+   196→   196→        }
+   197→   197→        onStep(STEP_FINAL, "done")
+   198→   198→        Outcome.Done(result)
+   199→   199→    }
+   200→   200→
+   201→   201→    /* ================= frames + OCR ================= */
+   202→   202→
+   203→   203→    private fun extractFrames(context: Context, videoUrl: String, count: Int): List<Bitmap> {
+   204→   204→        var file: File? = null
+   205→   205→        var mmr: MediaMetadataRetriever? = null
+   206→   206→        try {
+   207→   207→            file = downloadToCache(context, videoUrl) ?: return emptyList()
+   208→   208→            mmr = MediaMetadataRetriever()
+   209→   209→            mmr.setDataSource(file.absolutePath)
+   210→   210→            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+   211→   211→                ?.toLongOrNull() ?: 0L
+   212→   212→            if (durMs <= 0) return emptyList()
+   213→   213→            val out = mutableListOf<Bitmap>()
+   214→   214→            val fracs = doubleArrayOf(0.12, 0.45, 0.78)
+   215→   215→            for (f in fracs) {
+   216→   216→                if (out.size >= count) break
+   217→   217→                val bmp = try {
+   218→   218→                    mmr.getFrameAtTime(
+   219→   219→                        (durMs * 1000.0 * f).toLong(),
+   220→   220→                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+   221→   221→                    )
+   222→   222→                } catch (e: Exception) {
+   223→   223→                    null
+   224→   224→                }
+   225→   225→                if (bmp != null) out.add(bmp)
+   226→   226→            }
+   227→   227→            return out
+   228→   228→        } catch (e: Exception) {
+   229→   229→            return emptyList()
+   230→   230→        } finally {
+   231→   231→            try {
+   232→   232→                mmr?.release()
+   233→   233→            } catch (e: Exception) {
+   234→   234→            }
+   235→   235→            file?.delete()
+   236→   236→        }
+   237→   237→    }
+   238→   238→
+   239→   239→    /** Streams the video into cache with a hard size cap. Returns null on any failure. */
+   240→   240→    private fun downloadToCache(context: Context, url: String): File? {
+   241→   241→        var file: File? = null
+   242→   242→        try {
+   243→   243→            val req = Request.Builder()
+   244→   244→                .url(url)
+   245→   245→                .header("User-Agent", BROWSER_UA)
+   246→   246→                .header("Referer", "https://www.instagram.com/")
+   247→   247→                .build()
+   248→   248→            http.newCall(req).execute().use { resp ->
+   249→   249→                if (!resp.isSuccessful) return null
+   250→   250→                val body = resp.body ?: return null
+   251→   251→                val f = File(context.cacheDir, "filmyab_video_${System.currentTimeMillis()}.mp4")
+   252→   252→                file = f
+   253→   253→                val ok = body.byteStream().use { input ->
+   254→   254→                    f.outputStream().use { output -> copyCapped(input, output, MAX_VIDEO_BYTES) }
+   255→   255→                }
+   256→   256→                if (!ok || f.length() < 10_000) {
+   257→   257→                    f.delete()
+   258→   258→                    file = null
+   259→   259→                    return null
+   260→   260→                }
+   261→   261→                return f
+   262→   262→            }
+   263→   263→        } catch (e: Exception) {
+   264→   264→            file?.delete()
+   265→   265→            return null
+   266→   266→        }
+   267→   267→    }
+   268→   268→
+   269→   269→    /** Copies with a byte cap; false when the stream exceeded the cap or failed. */
+   270→   270→    private fun copyCapped(input: java.io.InputStream, output: java.io.OutputStream, cap: Long): Boolean {
+   271→   271→        val buf = ByteArray(64 * 1024)
+   272→   272→        var total = 0L
+   273→   273→        try {
+   274→   274→            while (true) {
+   275→   275→                val n = input.read(buf)
+   276→   276→                if (n < 0) break
+   277→   277→                total += n
+   278→   278→                if (total > cap) return false
+   279→   279→                output.write(buf, 0, n)
+   280→   280→            }
+   281→   281→            return true
+   282→   282→        } catch (e: Exception) {
+   283→   283→            return false
+   284→   284→        }
+   285→   285→    }
+   286→   286→
+   287→   287→    /** On-device OCR (bundled latin model — no downloads). Returns merged unique lines. */
+   288→   288→    private suspend fun runOcr(frames: List<Bitmap>): String = withContext(Dispatchers.IO) {
+   289→   289→        val latin = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+   290→   290→        val lines = LinkedHashSet<String>()
+   291→   291→        try {
+   292→   292→            for (bmp in frames) {
+   293→   293→                try {
+   294→   294→                    val text: Text = latin.process(InputImage.fromBitmap(bmp, 0)).await()
+   295→   295→                    for (line in text.text.split("\n")) {
+   296→   296→                        val t = line.trim()
+   297→   297→                        if (t.length >= 2) {
+   298→   298→                            lines.add(t)
+   299→   299→                        }
+   300→   300→                    }
+   301→   301→                } catch (e: Exception) {
+   302→   302→                    // OCR of this frame failed — keep going
+   303→   303→                }
+   304→   304→            }
+   305→   305→        } finally {
+   306→   306→            try {
+   307→   307→                latin.close()
+   308→   308→            } catch (e: Exception) {
+   309→   309→            }
+   310→   310→            frames.forEach { it.recycle() }
+   311→   311→        }
+   312→   312→        lines.take(14).joinToString(" | ").take(1400)
+   313→   313→    }
+   314→   314→
+   315→   315→    /* ================= LLM channel (keyless) ================= */
+   316→   316→
+   317→   317→    private fun callLlm(system: String, user: String): String? {
+   318→   318→        val delaysMs = longArrayOf(0, 3000, 8000)
+   319→   319→        for (attempt in delaysMs.indices) {
+   320→   320→            if (delaysMs[attempt] > 0) {
+   321→   321→                try {
+   322→   322→                    Thread.sleep(delaysMs[attempt])
+   323→   323→                } catch (e: InterruptedException) {
+   324→   324→                    Thread.currentThread().interrupt()
+   325→   325→                }
+   326→   326→            }
+   327→   327→            try {
+   328→   328→                val payload = JsonObject()
+   329→   329→                payload.addProperty("model", "openai")
+   330→   330→                val sys = JsonObject()
+   331→   331→                sys.addProperty("role", "system")
+   332→   332→                sys.addProperty("content", system)
+   333→   333→                val usr = JsonObject()
+   334→   334→                usr.addProperty("role", "user")
+   335→   335→                usr.addProperty("content", user)
+   336→   336→                val messages = JsonArray()
+   337→   337→                messages.add(sys)
+   338→   338→                messages.add(usr)
+   339→   339→                payload.add("messages", messages)
+   340→   340→                payload.addProperty("temperature", 0.2)
+   341→   341→
+   342→   342→                val request = Request.Builder()
+   343→   343→                    .url(POLLINATIONS_URL)
+   344→   344→                    .header("Accept", "application/json")
+   345→   345→                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
+   346→   346→                    .build()
+   347→   347→                http.newCall(request).execute().use { resp ->
+   348→   348→                    if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+   349→   349→                    val bodyStr = resp.body?.string() ?: throw IOException("empty body")
+   350→   350→                    val root = JsonParser.parseString(bodyStr).asJsonObject
+   351→   351→                    val choices = root.getAsJsonArray("choices") ?: throw IOException("no choices")
+   352→   352→                    if (choices.size() == 0) throw IOException("empty choices")
+   353→   353→                    val message = choices.get(0).asJsonObject.getAsJsonObject("message")
+   354→   354→                        ?: throw IOException("no message")
+   355→   355→                    val content = message.get("content")
+   356→   356→                    if (content == null || content.isJsonNull) throw IOException("no content")
+   357→   357→                    return content.asString
+   358→   358→                }
+   359→   359→            } catch (e: IOException) {
+   360→   360→                // network/HTTP failure — retry with backoff
+   361→   361→            } catch (e: Exception) {
+   362→   362→                break
+   363→   363→            }
+   364→   364→        }
+   365→   365→        return null
+   366→   366→    }
+   367→   367→
+   368→   368→    private fun extractJson(content: String): JsonObject? {
+   369→   369→        var cleaned = content.trim()
+   370→   370→        if (cleaned.startsWith("```")) {
+   371→   371→            cleaned = cleaned.removePrefix("```json").removePrefix("```").trim()
+   372→   372→            cleaned = cleaned.removeSuffix("```").trim()
+   373→   373→        }
+   374→   374→        val start = cleaned.indexOf('{')
+   375→   375→        val end = cleaned.lastIndexOf('}')
+   376→   376→        if (start < 0 || end <= start) return null
+   377→   377→        return try {
+   378→   378→            JsonParser.parseString(cleaned.substring(start, end + 1)).asJsonObject
+   379→   379→        } catch (e: Exception) {
+   380→   380→            null
+   381→   381→        }
+   382→   382→    }
+   383→   383→
+   384→   384→    private fun optString(obj: JsonObject, key: String): String? {
+   385→   385→        val el = obj.get(key) ?: return null
+   386→   386→        if (el.isJsonNull || !el.isJsonPrimitive) return null
+   387→   387→        return try {
+   388→   388→            el.asString.trim().takeIf { it.isNotEmpty() }
+   389→   389→        } catch (e: Exception) {
+   390→   390→            null
+   391→   391→        }
+   392→   392→    }
+   393→   393→
+   394→   394→    private fun optDouble(obj: JsonObject, key: String): Double {
+   395→   395→        val el = obj.get(key) ?: return 0.0
+   396→   396→        if (!el.isJsonPrimitive) return 0.0
+   397→   397→        return try {
+   398→   398→            val d = el.asDouble
+   399→   399→            if (d.isNaN()) 0.0 else d
+   400→   400→        } catch (e: Exception) {
+   401→   401→            0.0
+   402→   402→        }
+   403→   403→    }
+   404→   404→
+   405→   405→    private fun optBool(obj: JsonObject, key: String): Boolean {
+   406→   406→        val el = obj.get(key) ?: return false
+   407→   407→        if (!el.isJsonPrimitive) return false
+   408→   408→        return try {
+   409→   409→            el.asBoolean
+   410→   410→        } catch (e: Exception) {
+   411→   411→            false
+   412→   412→        }
+   413→   413→    }
+   414→   414→
+   415→   415→    /* ---- step 4: candidates ---- */
+   416→   416→
+   417→   417→    private const val CANDIDATES_SYSTEM =
+   418→   418→        "You are FilmYab, an on-device movie identification engine. You receive evidence scraped from an " +
+   419→   419→            "Instagram reel or post: caption, hashtags, uploader, page og-title, and text read from video " +
+   420→   420→            "frames by on-device OCR (may contain noise, watermarks, subtitle lines or title cards). " +
+   421→   421→            "Task: name the exact movie or series the clip is from. Pay special attention to title cards, " +
+   422→   422→            "credits, character names and subtitle phrases found by OCR. " +
+   423→   423→            "Reply ONLY with minified JSON, no markdown, exactly this schema: " +
+   424→   424→            "{\"scene_summary_fa\":\"یک جمله کوتاه فارسی درباره صحنه\"," +
+   425→   425→            "\"candidates\":[{\"title\":\"original English title\",\"year\":\"\",\"reason_fa\":\"دلیل کوتاه فارسی\"}]," +
+   426→   426→            "\"found\":true}. " +
+   427→   427→            "Rules: at most 3 candidates ordered by likelihood; year=\"\" if unsure; " +
+   428→   428→            "if the evidence is too weak to name any movie, set found=false and candidates=[]."
+   429→   429→
+   430→   430→    private fun askLlmCandidates(post: InstagramPost, ocrText: String): AiAnalysis? {
+   431→   431→        val sb = StringBuilder()
+   432→   432→        sb.append("Identify the movie from this Instagram post.\n")
+   433→   433→        post.ownerUsername?.let { sb.append("Uploader: @").append(it).append("\n") }
+   434→   434→        post.ogTitle?.let { sb.append("Page title: ").append(it.take(200)).append("\n") }
+   435→   435→        sb.append("Caption: ").append(post.caption?.take(900) ?: "(none)").append("\n")
+   436→   436→        if (post.hashtags.isNotEmpty()) {
+   437→   437→            sb.append("Hashtags: ").append(post.hashtags.joinToString(" ")).append("\n")
+   438→   438→        }
+   439→   439→        if (ocrText.isNotBlank()) {
+   440→   440→            sb.append("On-screen text (OCR): ").append(ocrText).append("\n")
+   441→   441→        }
+   442→   442→        val content = callLlm(CANDIDATES_SYSTEM, sb.toString()) ?: return null
+   443→   443→        val obj = extractJson(content) ?: return null
+   444→   444→
+   445→   445→        val candidates = mutableListOf<Candidate>()
+   446→   446→        val arr = obj.get("candidates")
+   447→   447→        if (arr != null && arr.isJsonArray) {
+   448→   448→            for (el in arr.asJsonArray) {
+   449→   449→                if (candidates.size >= 3) break
+   450→   450→                val o = el.takeIf { it.isJsonObject }?.asJsonObject ?: continue
+   451→   451→                val title = optString(o, "title") ?: continue
+   452→   452→                candidates.add(
+   453→   453→                    Candidate(
+   454→   454→                        name = title,
+   455→   455→                        year = optString(o, "year"),
+   456→   456→                        confidence = optDouble(o, "confidence").coerceIn(0.0, 1.0),
+   457→   457→                        reason = optString(o, "reason_fa")
+   458→   458→                    )
+   459→   459→                )
+   460→   460→            }
+   461→   461→        }
+   462→   462→        return AiAnalysis(
+   463→   463→            found = optBool(obj, "found") && candidates.isNotEmpty(),
+   464→   464→            sceneSummary = optString(obj, "scene_summary_fa"),
+   465→   465→            candidates = candidates
+   466→   466→        )
+   467→   467→    }
+   468→   468→
+   469→   469→    /* ---- step 5: Wikipedia verification (keyless) ---- */
+   470→   470→
+   471→   471→    private data class WikiPage(
+   472→   472→        val key: String,
+   473→   473→        val title: String,
+   474→   474→        val description: String?
+   475→   475→    )
+   476→   476→
+   477→   477→    private fun wikiSearch(lang: String, query: String, limit: Int): List<WikiPage> {
+   478→   478→        return try {
+   479→   479→            val q = URLEncoder.encode(query, "UTF-8")
+   480→   480→            val req = Request.Builder()
+   481→   481→                .url("https://$lang.wikipedia.org/w/rest.php/v1/search/title?q=$q&limit=$limit")
+   482→   482→                .header("User-Agent", BROWSER_UA)
+   483→   483→                .header("Accept", "application/json")
+   484→   484→                .build()
+   485→   485→            http.newCall(req).execute().use { resp ->
+   486→   486→                if (!resp.isSuccessful) return@use emptyList()
+   487→   487→                val bodyStr = resp.body?.string() ?: return@use emptyList()
+   488→   488→                val root = JsonParser.parseString(bodyStr).asJsonObject
+   489→   489→                val pages = root.getAsJsonArray("pages") ?: return@use emptyList()
+   490→   490→                val out = mutableListOf<WikiPage>()
+   491→   491→                for (el in pages) {
+   492→   492→                    val o = el.takeIf { it.isJsonObject }?.asJsonObject ?: continue
+   493→   493→                    val key = optString(o, "key") ?: continue
+   494→   494→                    val title = optString(o, "title") ?: key
+   495→   495→                    out.add(WikiPage(key, title, optString(o, "description")))
+   496→   496→                }
+   497→   497→                out
+   498→   498→            }
+   499→   499→        } catch (e: Exception) {
+   500→   500→            emptyList()
+   501→   501→        }
+   502→   502→    }
+   503→   503→
+   504→   504→    private fun wikiSummary(lang: String, key: String): JsonObject? {
+   505→   505→        return try {
+   506→   506→            val encoded = URLEncoder.encode(key, "UTF-8").replace("+", "%20")
+   507→   507→            val req = Request.Builder()
+   508→   508→                .url("https://$lang.wikipedia.org/api/rest_v1/page/summary/$encoded")
+   509→   509→                .header("User-Agent", BROWSER_UA)
+   510→   510→                .header("Accept", "application/json")
+   511→   511→                .build()
+   512→   512→            http.newCall(req).execute().use { resp ->
+   513→   513→                if (!resp.isSuccessful) return@use null
+   514→   514→                val bodyStr = resp.body?.string() ?: return@use null
+   515→   515→                JsonParser.parseString(bodyStr).asJsonObject
+   516→   516→            }
+   517→   517→        } catch (e: Exception) {
+   518→   518→            null
+   519→   519→        }
+   520→   520→    }
+   521→   521→
+   522→   522→    private val filmDescRegex = Regex("""(?i)\b(film|movie|series|television|miniseries)\b""")
+   523→   523→    private val yearRegex = Regex("""(19|20)\d{2}""")
+   524→   524→    private val directorRegex = Regex("""\bby ([A-Z][^,.;()]{2,40})""")
+   525→   525→
+   526→   526→    private fun buildWikiEvidence(page: WikiPage): WikiEvidence? {
+   527→   527→        val summary = wikiSummary("en", page.key) ?: return null
+   528→   528→        val description = optString(summary, "description")
+   529→   529→        val extract = optString(summary, "extract") ?: ""
+   530→   530→        val hay = listOfNotNull(description, extract.take(400)).joinToString(" ")
+   531→   531→        val isFilm = filmDescRegex.containsMatchIn(hay) ||
+   532→   532→            hay.contains("فیلم") || hay.contains("سریال")
+   533→   533→        if (!isFilm) return null
+   534→   534→
+   535→   535→        val year = description?.let { yearRegex.find(it)?.value }
+   536→   536→            ?: yearRegex.find(extract.take(200))?.value
+   537→   537→        val director = description?.let { directorRegex.find(it)?.groupValues?.get(1)?.trim() }
+   538→   538→        val originalImage = summary.getAsJsonObject("originalimage")
+   539→   539→        val thumbnailImage = summary.getAsJsonObject("thumbnail")
+   540→   540→        val poster = originalImage?.optStringSafe("source")
+   541→   541→            ?: thumbnailImage?.optStringSafe("source")
+   542→   542→        val pageUrl = try {
+   543→   543→            summary.getAsJsonObject("content_urls")
+   544→   544→                ?.getAsJsonObject("desktop")?.optStringSafe("page")
+   545→   545→        } catch (e: Exception) {
+   546→   546→            null
+   547→   547→        }
+   548→   548→
+   549→   549→        // Persian title: search fa-wiki with the english title, accept entries about films
+   550→   550→        var faTitle: String? = null
+   551→   551→        val faPages = wikiSearch("fa", page.title, 3)
+   552→   552→        for (fp in faPages) {
+   553→   553→            val d = fp.description ?: ""
+   554→   554→            if (d.contains("فیلم") || d.contains("سریال")) {
+   555→   555→                faTitle = fp.title
+   556→   556→                break
+   557→   557→            }
+   558→   558→        }
+   559→   559→
+   560→   560→        return WikiEvidence(
+   561→   561→            pageTitle = page.title,
+   562→   562→            pageDescription = description,
+   563→   563→            year = year,
+   564→   564→            director = director,
+   565→   565→            pageUrl = pageUrl,
+   566→   566→            posterUrl = poster,
+   567→   567→            faTitle = faTitle,
+   568→   568→            isFilm = true
+   569→   569→        )
+   570→   570→    }
+   571→   571→
+   572→   572→    private fun verifyCandidates(
+   573→   573→        candidates: List<Candidate>,
+   574→   574→        post: InstagramPost,
+   575→   575→        ocrText: String
+   576→   576→    ): List<VerifiedCandidate> {
+   577→   577→        val out = mutableListOf<VerifiedCandidate>()
+   578→   578→        val seen = mutableSetOf<String>()
+   579→   579→        for (c in candidates) {
+   580→   580→            if (out.size >= 3) break
+   581→   581→            val title = c.name ?: continue
+   582→   582→            val key = normalizedKey(title)
+   583→   583→            if (key.isEmpty() || seen.contains(key)) continue
+   584→   584→            seen.add(key)
+   585→   585→
+   586→   586→            val pages = wikiSearch("en", title, 5)
+   587→   587→            var chosen: WikiPage? = null
+   588→   588→            for (p in pages) {
+   589→   589→                val d = p.description ?: ""
+   590→   590→                if (filmDescRegex.containsMatchIn(d) || d.contains("فیلم")) {
+   591→   591→                    chosen = p
+   592→   592→                    break
+   593→   593→                }
+   594→   594→            }
+   595→   595→            if (chosen == null) {
+   596→   596→                chosen = pages.firstOrNull { normalizedKey(it.title) == key }
+   597→   597→            }
+   598→   598→            if (chosen == null) {
+   599→   599→                // try a sharper query "title film"
+   600→   600→                chosen = wikiSearch("en", "$title film", 4)
+   601→   601→                    .firstOrNull { filmDescRegex.containsMatchIn(it.description ?: "") }
+   602→   602→            }
+   603→   603→
+   604→   604→            val wiki = chosen?.let { buildWikiEvidence(it) }
+   605→   605→            val score = scoreCandidate(c, post, ocrText, wiki)
+   606→   606→            if (wiki != null || score >= 0.5) {
+   607→   607→                out.add(VerifiedCandidate(c, wiki, score))
+   608→   608→            }
+   609→   609→        }
+   610→   610→        return out.sortedByDescending { it.score }
+   611→   611→    }
+   612→   612→
+   613→   613→    /* ================= self-built scoring ================= */
+   614→   614→
+   615→   615→    private fun normalizedKey(s: String): String =
+   616→   616→        s.lowercase(Locale.ROOT).replace(Regex("[^a-z0-9\\p{L}\\p{N}]"), "")
+   617→   617→
+   618→   618→    private fun normalizedContains(haystack: String, needle: String): Boolean {
+   619→   619→        val n = normalizedKey(needle)
+   620→   620→        if (n.length < 3) return false
+   621→   621→        return normalizedKey(haystack).contains(n)
+   622→   622→    }
+   623→   623→
+   624→   624→    private fun scoreCandidate(
+   625→   625→        c: Candidate,
+   626→   626→        post: InstagramPost,
+   627→   627→        ocrText: String,
+   628→   628→        wiki: WikiEvidence?
+   629→   629→    ): Double {
+   630→   630→        var score = c.confidence.takeIf { it > 0.0 } ?: 0.5
+   631→   631→        if (wiki != null && wiki.isFilm) score += 0.25
+   632→   632→
+   633→   633→        val title = c.name ?: return score.coerceIn(0.05, 0.97)
+   634→   634→        val hay = listOfNotNull(post.caption, post.ogTitle, post.ownerUsername).joinToString(" ")
+   635→   635→        if (normalizedContains(hay, title)) score += 0.10
+   636→   636→        if (ocrText.isNotBlank() && normalizedContains(ocrText, title)) score += 0.15
+   637→   637→        val tagHay = post.hashtags.joinToString("").lowercase(Locale.US)
+   638→   638→        val titleKey = normalizedKey(title)
+   639→   639→        if (titleKey.length >= 3 && tagHay.contains(titleKey)) score += 0.10
+   640→   640→
+   641→   641→        return score.coerceAtMost(0.97)
+   642→   642→    }
+   643→   643→
+   644→   644→    /* ================= final assembly ================= */
+   645→   645→
+   646→   646→    private fun googleQueryFor(titleEn: String?, year: String?): String? =
+   647→   647→        listOfNotNull(titleEn, year, "movie").joinToString(" ").trim().takeIf { it.isNotBlank() }
+   648→   648→
+   649→   649→    private fun buildFinal(
+   650→   650→        best: VerifiedCandidate,
+   651→   651→        others: List<VerifiedCandidate>,
+   652→   652→        ai: AiAnalysis,
+   653→   653→        post: InstagramPost,
+   654→   654→        ocrText: String
+   655→   655→    ): SmartResult {
+   656→   656→        val w = best.wiki
+   657→   657→        val titleEn = best.candidate.name ?: w?.pageTitle
+   658→   658→        val year = w?.year ?: best.candidate.year
+   659→   659→        val conf = best.score
+   660→   660→
+   661→   661→        val reasoning = mutableListOf<String>()
+   662→   662→        best.candidate.reason?.let { reasoning.add(it) }
+   663→   663→        w?.let {
+   664→   664→            val d = it.pageDescription
+   665→   665→            reasoning.add(
+   666→   666→                "در ویکی‌پدیا تأیید شد: ${it.pageTitle}" + (d?.let { x -> " ($x)" } ?: "")
+   667→   667→            )
+   668→   668→        }
+   669→   669→        if (ocrText.isNotBlank()) reasoning.add("متن روی تصویر هم تحلیل شد")
+   670→   670→
+   671→   671→        val evidenceBits = mutableListOf<String>()
+   672→   672→        if (!post.caption.isNullOrBlank()) evidenceBits.add("کپشن")
+   673→   673→        if (post.hashtags.isNotEmpty()) evidenceBits.add("هشتگ")
+   674→   674→        if (!post.ogTitle.isNullOrBlank()) evidenceBits.add("عنوان صفحه")
+   675→   675→        if (ocrText.isNotBlank()) evidenceBits.add("متن روی تصویر (OCR)")
+   676→   676→        if (w != null) evidenceBits.add("ویکی‌پدیا")
+   677→   677→
+   678→   678→        return SmartResult(
+   679→   679→            status = if (conf >= 0.55) "success" else "low_confidence",
+   680→   680→            titleEn = titleEn,
+   681→   681→            titleFa = w?.faTitle,
+   682→   682→            year = year,
+   683→   683→            director = w?.director,
+   684→   684→            genres = emptyList(),
+   685→   685→            confidence = conf,
+   686→   686→            reasoningFa = reasoning.joinToString(" — ").takeIf { it.isNotBlank() },
+   687→   687→            posterUrl = w?.posterUrl,
+   688→   688→            wikiUrl = w?.pageUrl,
+   689→   689→            googleQuery = googleQueryFor(titleEn, year),
+   690→   690→            candidates = others.take(3).map {
+   691→   691→                Candidate(
+   692→   692→                    name = it.candidate.name ?: it.wiki?.pageTitle,
+   693→   693→                    year = it.wiki?.year ?: it.candidate.year,
+   694→   694→                    confidence = it.score
+   695→   695→                )
+   696→   696→            },
+   697→   697→            sceneSummary = ai.sceneSummary,
+   698→   698→            evidenceSummary = "شواهد: " + evidenceBits.joinToString(" + "),
+   699→   699→            instagramUrl = null,
+   700→   700→            sourceMode = "smart"
+   701→   701→        )
+   702→   702→    }
+   703→   703→
+   704→   704→    /* ---- step 6b: fusion LLM (only when score is not decisive) ---- */
+   705→   705→
+   706→   706→    private const val FUSION_SYSTEM =
+   707→   707→        "You are FilmYab's fusion engine. You get the scraped Instagram evidence, candidate movies from a " +
+   708→   708→            "previous pass, and Wikipedia evidence for each candidate. Choose the single best matching movie " +
+   709→   709→            "and produce the final answer. Reply ONLY with minified JSON, no markdown, exactly: " +
+   710→   710→            "{\"found\":true,\"title_en\":\"\",\"title_fa\":\"\",\"year\":\"\",\"director\":\"\"," +
+   711→   711→            "\"genres\":[\"\"],\"confidence\":0.0,\"reasoning_fa\":\"\"}. " +
+   712→   712→            "confidence is 0..1 and must reflect how certain the combined evidence really is. " +
+   713→   713→            "If the evidence contradicts all candidates set found=false."
+   714→   714→
+   715→   715→    private fun askLlmFusion(
+   716→   716→        verified: List<VerifiedCandidate>,
+   717→   717→        ai: AiAnalysis,
+   718→   718→        post: InstagramPost,
+   719→   719→        ocrText: String
+   720→   720→    ): Fused? {
+   721→   721→        val sb = StringBuilder()
+   722→   722→        sb.append("Instagram evidence:\n")
+   723→   723→        post.ogTitle?.let { sb.append("Page title: ").append(it.take(160)).append("\n") }
+   724→   724→        sb.append("Caption: ").append(post.caption?.take(500) ?: "(none)").append("\n")
+   725→   725→        if (ocrText.isNotBlank()) sb.append("OCR: ").append(ocrText.take(500)).append("\n")
+   726→   726→        sb.append("\nAI candidates:\n")
+   727→   727→        ai.candidates.forEachIndexed { i, c ->
+   728→   728→            sb.append(i + 1).append(". ").append(c.name ?: "?")
+   729→   729→                .append(" (").append(c.year ?: "?").append(") — ")
+   730→   730→                .append(c.reason ?: "").append("\n")
+   731→   731→        }
+   732→   732→        sb.append("\nWikipedia evidence:\n")
+   733→   733→        verified.forEachIndexed { i, v ->
+   734→   734→            sb.append(i + 1).append(". ").append(v.wiki?.pageTitle ?: "(not verified)")
+   735→   735→            v.wiki?.pageDescription?.let { sb.append(" | ").append(it) }
+   736→   736→            sb.append(" | engine score=").append(String.format(Locale.US, "%.2f", v.score))
+   737→   737→            sb.append("\n")
+   738→   738→        }
+   739→   739→        val content = callLlm(FUSION_SYSTEM, sb.toString()) ?: return null
+   740→   740→        val obj = extractJson(content) ?: return null
+   741→   741→        val genres = mutableListOf<String>()
+   742→   742→        val g = obj.get("genres")
+   743→   743→        if (g != null && g.isJsonArray) {
+   744→   744→            for (el in g.asJsonArray) {
+   745→   745→                val s = el.takeIf { it.isJsonPrimitive }?.asString?.trim()
+   746→   746→                if (!s.isNullOrBlank() && genres.size < 5) genres.add(s)
+   747→   747→            }
+   748→   748→        }
+   749→   749→        return Fused(
+   750→   750→            found = optBool(obj, "found"),
+   751→   751→            titleEn = optString(obj, "title_en"),
+   752→   752→            titleFa = optString(obj, "title_fa"),
+   753→   753→            year = optString(obj, "year"),
+   754→   754→            director = optString(obj, "director"),
+   755→   755→            genres = genres,
+   756→   756→            confidence = optDouble(obj, "confidence").coerceIn(0.0, 1.0),
+   757→   757→            reasoningFa = optString(obj, "reasoning_fa")
+   758→   758→        )
+   759→   759→    }
+   760→   760→
+   761→   761→    private fun blend(base: SmartResult, fused: Fused): SmartResult {
+   762→   762→        if (!fused.found) {
+   763→   763→            val capped = minOf(base.confidence, 0.55)
+   764→   764→            return base.copy(
+   765→   765→                confidence = capped,
+   766→   766→                status = if (capped >= 0.55) "success" else "low_confidence"
+   767→   767→            )
+   768→   768→        }
+   769→   769→        val sameTitle = normalizedKey(fused.titleEn ?: "").isNotEmpty() &&
+   770→   770→            normalizedKey(fused.titleEn ?: "") == normalizedKey(base.titleEn ?: "")
+   771→   771→        return if (sameTitle) {
+   772→   772→            val conf = (0.6 * base.confidence + 0.4 * fused.confidence).coerceIn(0.0, 0.97)
+   773→   773→            base.copy(
+   774→   774→                confidence = conf,
+   775→   775→                titleFa = base.titleFa ?: fused.titleFa,
+   776→   776→                year = base.year ?: fused.year,
+   777→   777→                director = base.director ?: fused.director,
+   778→   778→                genres = if (fused.genres.isNotEmpty()) fused.genres else base.genres,
+   779→   779→                reasoningFa = listOfNotNull(base.reasoningFa, fused.reasoningFa)
+   780→   780→                    .joinToString(" — "),
+   781→   781→                status = if (conf >= 0.55) "success" else "low_confidence"
+   782→   782→            )
+   783→   783→        } else if (fused.confidence > base.confidence) {
+   784→   784→            val conf = (fused.confidence * 0.85).coerceIn(0.0, 0.9)
+   785→   785→            SmartResult(
+   786→   786→                status = if (conf >= 0.55) "success" else "low_confidence",
+   787→   787→                titleEn = fused.titleEn,
+   788→   788→                titleFa = fused.titleFa,
+   789→   789→                year = fused.year ?: base.year,
+   790→   790→                director = fused.director,
+   791→   791→                genres = fused.genres,
+   792→   792→                confidence = conf,
+   793→   793→                reasoningFa = fused.reasoningFa,
+   794→   794→                posterUrl = base.posterUrl,
+   795→   795→                wikiUrl = base.wikiUrl,
+   796→   796→                googleQuery = googleQueryFor(fused.titleEn, fused.year),
+   797→   797→                candidates = base.candidates,
+   798→   798→                sceneSummary = base.sceneSummary,
+   799→   799→                evidenceSummary = base.evidenceSummary,
+   800→   800→                instagramUrl = base.instagramUrl,
+   801→   801→                sourceMode = base.sourceMode
+   802→   802→            )
+   803→   803→        } else {
+   804→   804→            val capped = minOf(base.confidence, 0.7)
+   805→   805→            base.copy(
+   806→   806→                confidence = capped,
+   807→   807→                status = if (capped >= 0.55) "success" else "low_confidence"
+   808→   808→            )
+   809→   809→        }
+   810→   810→    }
+   811→   811→
+   812→   812→    private fun JsonObject.optStringSafe(key: String): String? {
+   813→   813→        val el = this.get(key) ?: return null
+   814→   814→        if (el.isJsonNull || !el.isJsonPrimitive) return null
+   815→   815→        return try {
+   816→   816→            el.asString.trim().takeIf { it.isNotEmpty() }
+   817→   817→        } catch (e: Exception) {
+   818→   818→            null
+   819→   819→        }
+   820→   820→    }
+   821→   821→}
+   822→   822→
