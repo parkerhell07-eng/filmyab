@@ -4,7 +4,6 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -55,13 +54,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
-import com.filmyab.app.data.PipelineResult
-import com.filmyab.app.data.QuickResult
+import com.filmyab.app.data.SmartResult
 import com.filmyab.app.ui.theme.Accent
 import com.filmyab.app.ui.theme.DimText
 import com.filmyab.app.ui.theme.ErrorRed
 import com.filmyab.app.ui.theme.NavIndicator
-import com.filmyab.app.ui.theme.OnAccent
 import com.filmyab.app.ui.theme.OnBg
 import com.filmyab.app.ui.theme.OnSurfaceVariantDark
 import com.filmyab.app.ui.theme.StatusLow
@@ -99,7 +96,7 @@ fun PosterImage(url: String?, modifier: Modifier = Modifier) {
     }
 }
 
-/** One pipeline step row: state icon + Persian label. */
+/** One engine step row: state icon + Persian label. */
 @Composable
 fun StepRow(label: String, status: String) {
     Row(
@@ -169,7 +166,7 @@ fun ConfidenceBar(confidence: Double) {
     }
 }
 
-/** Card wrapper with a bold title, used by History/Settings sections. */
+/** Card wrapper with a bold title. */
 @Composable
 fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Card(
@@ -187,19 +184,17 @@ fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     }
 }
 
-/** Server pipeline result card: poster, names, meta, confidence, reasoning, candidates, sources. */
+/** Smart engine result card: poster, names, meta, confidence, reasoning, wiki, candidates. */
 @Composable
-fun ResultCard(result: PipelineResult, onRetry: () -> Unit) {
+fun SmartResultCard(result: SmartResult, onRetry: () -> Unit) {
     var detailsExpanded by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
-    val title = result.originalName ?: result.movieName ?: "—"
-    val subtitle = result.movieName?.takeIf { it.isNotBlank() && it != title }
+    val title = result.titleEn ?: result.titleFa ?: "—"
+    val subtitle = result.titleFa?.takeIf { it.isNotBlank() && it != title }
     val year = result.year
     val director = result.director
-    val reasoning = result.reasoning
-    val sceneDescription = result.sceneDescription
-    val caption = result.caption
+    val reasoning = result.reasoningFa
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -254,7 +249,7 @@ fun ResultCard(result: PipelineResult, onRetry: () -> Unit) {
                                 tint = DimText,
                                 modifier = Modifier.size(15.dp)
                             )
-                            Text(director, fontSize = 13.sp, color = OnSurfaceVariantDark)
+                            Text("کارگردان: $director", fontSize = 13.sp, color = OnSurfaceVariantDark)
                         }
                     }
                 }
@@ -308,6 +303,67 @@ fun ResultCard(result: PipelineResult, onRetry: () -> Unit) {
                 )
             }
 
+            if (result.wikiUrl != null || result.googleQuery != null) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (result.wikiUrl != null) {
+                        FilledTonalButton(
+                            onClick = {
+                                try {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(result.wikiUrl))
+                                    )
+                                } catch (e: Exception) {
+                                    // ignore malformed URLs
+                                }
+                            },
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = NavIndicator,
+                                contentColor = Accent
+                            )
+                        ) {
+                            Icon(
+                                Icons.Filled.Link,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text("ویکی‌پدیا", fontSize = 13.sp)
+                        }
+                    }
+                    if (result.googleQuery != null) {
+                        FilledTonalButton(
+                            onClick = {
+                                try {
+                                    context.startActivity(
+                                        Intent(
+                                            Intent.ACTION_VIEW,
+                                            Uri.parse(
+                                                "https://www.google.com/search?q=" +
+                                                    Uri.encode(result.googleQuery)
+                                            )
+                                        )
+                                    )
+                                } catch (e: Exception) {
+                                    // ignore
+                                }
+                            },
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = NavIndicator,
+                                contentColor = Accent
+                            )
+                        ) {
+                            Icon(
+                                Icons.Filled.Search,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text("جستجوی بیشتر", fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+
             if (result.candidates.isNotEmpty()) {
                 Text("گزینه‌های دیگر", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = OnBg)
                 Column(
@@ -342,51 +398,8 @@ fun ResultCard(result: PipelineResult, onRetry: () -> Unit) {
                 }
             }
 
-            if (result.sources.isNotEmpty()) {
-                Text("منابع", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = OnBg)
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    result.sources.forEach { source ->
-                        val url = source.url
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                Icons.Filled.Link,
-                                contentDescription = null,
-                                tint = Accent,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            if (url != null) {
-                                Text(
-                                    source.name ?: url,
-                                    fontSize = 13.sp,
-                                    color = Accent,
-                                    modifier = Modifier.clickable {
-                                        try {
-                                            context.startActivity(
-                                                Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                                            )
-                                        } catch (e: Exception) {
-                                            // ignore malformed URLs
-                                        }
-                                    }
-                                )
-                            } else {
-                                Text(
-                                    source.name ?: "",
-                                    fontSize = 13.sp,
-                                    color = OnSurfaceVariantDark
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            if ((sceneDescription != null && sceneDescription.isNotBlank()) ||
-                (caption != null && caption.isNotBlank())
+            if ((result.sceneSummary != null && result.sceneSummary.isNotBlank()) ||
+                (result.evidenceSummary != null && result.evidenceSummary.isNotBlank())
             ) {
                 TextButton(onClick = { detailsExpanded = !detailsExpanded }) {
                     Text(
@@ -397,7 +410,21 @@ fun ResultCard(result: PipelineResult, onRetry: () -> Unit) {
                 }
                 if (detailsExpanded) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (sceneDescription != null && sceneDescription.isNotBlank()) {
+                        if (result.evidenceSummary != null && result.evidenceSummary.isNotBlank()) {
+                            Text(
+                                "شواهد استفاده‌شده",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = DimText
+                            )
+                            Text(
+                                result.evidenceSummary,
+                                fontSize = 13.sp,
+                                color = OnSurfaceVariantDark,
+                                lineHeight = 20.sp
+                            )
+                        }
+                        if (result.sceneSummary != null && result.sceneSummary.isNotBlank()) {
                             Text(
                                 "توضیح صحنه",
                                 fontWeight = FontWeight.Bold,
@@ -405,21 +432,7 @@ fun ResultCard(result: PipelineResult, onRetry: () -> Unit) {
                                 color = DimText
                             )
                             Text(
-                                sceneDescription,
-                                fontSize = 13.sp,
-                                color = OnSurfaceVariantDark,
-                                lineHeight = 20.sp
-                            )
-                        }
-                        if (caption != null && caption.isNotBlank()) {
-                            Text(
-                                "کپشن پست",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 13.sp,
-                                color = DimText
-                            )
-                            Text(
-                                caption,
+                                result.sceneSummary,
                                 fontSize = 13.sp,
                                 color = OnSurfaceVariantDark,
                                 lineHeight = 20.sp
@@ -431,90 +444,6 @@ fun ResultCard(result: PipelineResult, onRetry: () -> Unit) {
 
             TextButton(onClick = onRetry) {
                 Text("شناسایی مجدد", color = Accent)
-            }
-        }
-    }
-}
-
-/** On-device quick mode result card. */
-@Composable
-fun QuickResultCard(quick: QuickResult) {
-    val context = LocalContext.current
-    val titleFa = quick.titleFa
-    val year = quick.year
-    val reasoning = quick.reasoningFa
-    val query = quick.googleQuery
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = SurfaceDark)
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Surface(color = NavIndicator, shape = RoundedCornerShape(50)) {
-                Text(
-                    "تحلیل سریع روی دستگاه",
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                    fontSize = 11.sp,
-                    color = Accent
-                )
-            }
-            Text(
-                quick.title ?: "—",
-                fontWeight = FontWeight.Bold,
-                fontSize = 22.sp,
-                color = OnBg
-            )
-            if (titleFa != null && titleFa != quick.title) {
-                Text(titleFa, fontSize = 16.sp, color = Accent)
-            }
-            if (year != null) {
-                Text("سال: $year", fontSize = 13.sp, color = OnSurfaceVariantDark)
-            }
-            ConfidenceBar(quick.confidence)
-            if (reasoning != null && reasoning.isNotBlank()) {
-                Text(reasoning, fontSize = 14.sp, color = OnBg, lineHeight = 22.sp)
-            }
-            if (quick.alternatives.isNotEmpty()) {
-                Text("گزینه‌های احتمالی دیگر:", fontSize = 13.sp, color = DimText)
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    quick.alternatives.forEach { alternative ->
-                        val alternativeYear = alternative.year
-                        Text(
-                            "• " + (alternative.name ?: "—") +
-                                (if (alternativeYear != null) " ($alternativeYear)" else ""),
-                            fontSize = 13.sp,
-                            color = OnSurfaceVariantDark
-                        )
-                    }
-                }
-            }
-            if (query != null) {
-                FilledTonalButton(
-                    onClick = {
-                        try {
-                            context.startActivity(
-                                Intent(
-                                    Intent.ACTION_VIEW,
-                                    Uri.parse("https://www.google.com/search?q=" + Uri.encode(query))
-                                )
-                            )
-                        } catch (e: Exception) {
-                            // ignore
-                        }
-                    },
-                    colors = ButtonDefaults.filledTonalButtonColors(
-                        containerColor = NavIndicator,
-                        contentColor = Accent
-                    )
-                ) {
-                    Icon(Icons.Filled.Search, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("جستجوی بیشتر در گوگل")
-                }
             }
         }
     }

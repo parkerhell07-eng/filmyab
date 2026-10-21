@@ -35,8 +35,8 @@ jobs:
       - name: Collect APKs
         run: |
           mkdir -p apks
-          cp android-app/app/build/outputs/apk/debug/app-debug.apk apks/FilmYab-v1.0-debug.apk
-          cp android-app/app/build/outputs/apk/release/app-release.apk apks/FilmYab-v1.0-release.apk
+          cp android-app/app/build/outputs/apk/debug/app-debug.apk apks/FilmYab-v2.0-debug.apk
+          cp android-app/app/build/outputs/apk/release/app-release.apk apks/FilmYab-v2.0-release.apk
           ls -la apks
 
       - name: Upload artifact
@@ -48,17 +48,21 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: FilmYab v1.0.${{ github.run_number }}
+          tag_name: v2.0.${{ github.run_number }}
+          name: FilmYab v2.0.${{ github.run_number }}
           body: |
-            🎬 **فیلم‌یاب** — نصب اندروید
+            🎬 **فیلم‌یاب نسخه ۲.۰ — موتور هوشمند روی دستگاه**
 
             | فایل | توضیح |
             |---|---|
-            | `FilmYab-v1.0-debug.apk` | نسخه پیشنهادی برای نصب |
-            | `FilmYab-v1.0-release.apk` | نسخه release (امضا با کلید debug) |
+            | `FilmYab-v2.0-debug.apk` | نسخه پیشنهادی برای نصب |
+            | `FilmYab-v2.0-release.apk` | نسخه release (امضا با کلید debug) |
 
             **نصب:** فایل APK را دانلود و اجرا کنید؛ اگر اندروید پرسید، اجازه «نصب از منابع ناشناس» را بدهید.
 
-            **تنظیم سرور:** برای تحلیل کامل (فریم‌ها + هوش مصنوعی بینایی + جستجوی وب)، در تب «تنظیمات» برنامه آدرس سرور بک‌اند را وارد کنید. بدون سرور، حالت «تحلیل سریع روی دستگاه» به‌صورت خودکار کار می‌کند.
+            **تغییرات بزرگ نسخه ۲:**
+            - ❌ سرور شناسایی حذف شد — دیگر هیچ تنظیماتی لازم نیست
+            - 🧠 موتور هوشمند کاملاً روی دستگاه اجرا می‌شود: متادیتای پست + فریم‌های ویدیو + خواندن متن روی تصویر (OCR) + تحلیل هوشمند + تأیید ویکی‌پدیا
+            - 📋 تشخیص خودکار لینک از کلیپ‌بورد و شروع خودکار شناسایی
+            - 🔌 تشخیص خودکار فیلترشکن؛ فقط وقتی فیلترشکن روشن باشد اینستاگرام خوانده می‌شود
           files: apks/*.apk

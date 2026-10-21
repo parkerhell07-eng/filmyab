@@ -226,6 +226,7 @@ private fun StatusChip(status: String) {
 }
 
 private fun sourceLabel(source: String): String = when (source) {
+    "smart" -> "خودکار"
     "link" -> "لینک"
     "screenshot" -> "اسکرین‌شات"
     "quick" -> "سریع"

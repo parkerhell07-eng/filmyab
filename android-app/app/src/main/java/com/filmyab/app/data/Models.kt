@@ -1,84 +1,78 @@
 package com.filmyab.app.data
 
 /**
- * Data models shared across the app. All JSON-facing fields are nullable (or defaulted)
- * so Gson deserialization never crashes on missing keys.
+ * Data models of FilmYab v2 (fully on-device smart engine — no server).
+ * All JSON-facing fields are nullable (or defaulted) so Gson never crashes.
  */
 
-/** Progress event from the server SSE pipeline. */
-data class StepEvent(
-    val step: String? = null,
-    val status: String? = null,
-    val data: Map<String, Any?>? = null
+/** One candidate movie suggested by the engine. */
+data class Candidate(
+    val name: String? = null,
+    val year: String? = null,
+    val confidence: Double = 0.0,
+    val reason: String? = null
 )
 
-/** Terminal success payload of POST /api/identify. */
-data class PipelineResult(
-    val status: String? = null,
-    val movieName: String? = null,
-    val originalName: String? = null,
+/** Final result of the on-device smart engine. */
+data class SmartResult(
+    val status: String = "success", // success | low_confidence
+    val titleEn: String? = null,
+    val titleFa: String? = null,
     val year: String? = null,
     val director: String? = null,
     val genres: List<String> = emptyList(),
     val confidence: Double = 0.0,
-    val reasoning: String? = null,
-    val candidates: List<Candidate> = emptyList(),
-    val posterUrl: String? = null,
-    val sources: List<WebSource> = emptyList(),
-    val instagramUrl: String? = null,
-    val caption: String? = null,
-    val sceneDescription: String? = null,
-    val sourceMode: String? = null
-)
-
-data class Candidate(
-    val name: String? = null,
-    val year: String? = null,
-    val confidence: Double = 0.0
-)
-
-data class WebSource(
-    val name: String? = null,
-    val url: String? = null
-)
-
-/** Item shape of GET /api/history (server-side history). */
-data class HistoryItem(
-    val id: String? = null,
-    val instagramUrl: String? = null,
-    val status: String? = null,
-    val movieName: String? = null,
-    val originalName: String? = null,
-    val year: String? = null,
-    val confidence: Double = 0.0,
-    val posterUrl: String? = null,
-    val source: String? = null,
-    val genres: List<String> = emptyList(),
-    val createdAt: String? = null
-)
-
-/** On-device quick-mode result (Pollinations text LLM). */
-data class QuickResult(
-    val found: Boolean = false,
-    val title: String? = null,
-    val titleFa: String? = null,
-    val year: String? = null,
-    val confidence: Double = 0.0,
     val reasoningFa: String? = null,
-    val alternatives: List<Candidate> = emptyList(),
-    val googleQuery: String? = null
+    val posterUrl: String? = null,
+    val wikiUrl: String? = null,
+    val googleQuery: String? = null,
+    val candidates: List<Candidate> = emptyList(),
+    val sceneSummary: String? = null,
+    val evidenceSummary: String? = null,
+    val instagramUrl: String? = null,
+    val sourceMode: String = "smart"
 )
 
-/** Instagram post scraped on-device by [InstagramScraper]. */
+/**
+ * Connectivity state detected automatically.
+ * kind: "checking" | "ok" (instagram reachable) | "vpn_needed" (internet ok, IG blocked) | "offline"
+ */
+data class NetState(
+    val kind: String = "checking",
+    val instagramOk: Boolean = false,
+    val internetOk: Boolean = false
+)
+
+/** Instagram post scraped entirely on device. */
 data class InstagramPost(
     val shortcode: String,
     val type: String,
     val caption: String? = null,
+    val ogTitle: String? = null,
     val hashtags: List<String> = emptyList(),
     val videoUrl: String? = null,
     val thumbnailUrl: String? = null,
     val ownerUsername: String? = null,
     val method: String = ""
+)
+
+/** Wikipedia evidence attached to a verified candidate. */
+data class WikiEvidence(
+    val pageTitle: String? = null,
+    val pageDescription: String? = null,
+    val year: String? = null,
+    val director: String? = null,
+    val pageUrl: String? = null,
+    val posterUrl: String? = null,
+    val faTitle: String? = null,
+    val isFilm: Boolean = false
+)
+
+/** A candidate after verification + scoring. */
+data class VerifiedCandidate(
+    val candidate: Candidate,
+    val wiki: WikiEvidence?,
+    val score: Double
 )
 
 /** Local (on-device) history entry persisted in SharedPreferences. */
@@ -90,7 +84,7 @@ data class LocalHistoryItem(
     val confidence: Double = 0.0,
     val posterUrl: String? = null,
     val instagramUrl: String? = null,
-    val source: String = "link",
+    val source: String = "smart",
     val createdAtMs: Long = 0L,
     val genres: List<String> = emptyList()
 )

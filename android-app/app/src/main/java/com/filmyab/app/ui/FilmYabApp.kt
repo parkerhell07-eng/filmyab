@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Movie
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -29,6 +28,7 @@ import com.filmyab.app.ui.theme.SurfaceDark
 
 private data class TabItem(val icon: ImageVector, val label: String)
 
+/** v2: only two tabs — no settings, no server, nothing to configure. */
 @Composable
 fun FilmYabApp() {
     val viewModel: MainViewModel = viewModel()
@@ -36,8 +36,7 @@ fun FilmYabApp() {
 
     val tabs = listOf(
         TabItem(Icons.Filled.Movie, "شناسایی"),
-        TabItem(Icons.Filled.History, "تاریخچه"),
-        TabItem(Icons.Filled.Settings, "تنظیمات")
+        TabItem(Icons.Filled.History, "تاریخچه")
     )
 
     Scaffold(
@@ -65,8 +64,7 @@ fun FilmYabApp() {
         Box(modifier = Modifier.padding(innerPadding)) {
             when (selectedTab) {
                 0 -> IdentifyScreen(viewModel)
-                1 -> HistoryScreen(viewModel)
-                else -> SettingsScreen(viewModel)
+                else -> HistoryScreen(viewModel)
             }
         }
     }

@@ -14,15 +14,19 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
- * On-device Instagram scraper mirroring the backend logic:
- * 1. embed/captioned HTML
- * 2. ?__a=1&__d=dis JSON with X-IG-App-ID
- * 3. og: meta tags (both attribute orders)
+ * On-device Instagram scraper for the smart engine (no server involved).
+ *
+ * Methods (run in parallel, merged):
+ *  1. crawler — post page with a search-engine User-Agent (Googlebot). Instagram serves
+ *     og:title / og:description / og:image and signed .mp4 URLs to crawlers without login.
+ *  2. embed — /p/{code}/embed/captioned/ HTML with a browser UA (plain JSON inside).
+ *  3. api — ?__a=1&__d=dis JSON with X-IG-App-ID (works on some networks).
+ *  4. og — plain post page with a browser UA, og: meta tags only.
  *
  * NOTE: [parseInstagramUrl] is intentionally pure (no network). The `/share/...`
- * redirect resolution is a network operation and therefore lives in [fetchPost],
- * which always runs on Dispatchers.IO — calling it from the main thread would
- * throw NetworkOnMainThreadException.
+ * redirect resolution is a network operation and therefore lives inside [fetchPost],
+ * which always runs on Dispatchers.IO — calling it from the main thread would throw
+ * NetworkOnMainThreadException.
  */
 object InstagramScraper {
 
@@ -32,11 +36,13 @@ object InstagramScraper {
 
     private const val BROWSER_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    private const val CRAWLER_UA =
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
     private const val IG_APP_ID = "936619743392459"
 
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -89,8 +95,8 @@ object InstagramScraper {
     /* ---------------- Fetch ---------------- */
 
     /**
-     * Scrapes the post with three parallel attempts and merges the first non-null
-     * fields. Returns null unless at least one of caption/videoUrl/thumbnailUrl exists.
+     * Scrapes the post with several parallel attempts and merges the first non-null fields.
+     * Returns null unless at least one of caption/videoUrl/thumbnailUrl exists.
      */
     suspend fun fetchPost(rawUrl: String): InstagramPost? = withContext(Dispatchers.IO) {
         try {
@@ -109,6 +115,7 @@ object InstagramScraper {
 
             val attempts: List<Pair<String, InstagramPost?>> = coroutineScope {
                 listOf(
+                    async { "crawler" to fetchViaCrawler(shortcode) },
                     async { "embed" to fetchViaEmbed(shortcode) },
                     async { "api" to fetchViaApi(shortcode) },
                     async { "og" to fetchViaOg(shortcode) }
@@ -116,6 +123,7 @@ object InstagramScraper {
             }
 
             var caption: String? = null
+            var ogTitle: String? = null
             var videoUrl: String? = null
             var thumbnailUrl: String? = null
             var ownerUsername: String? = null
@@ -123,6 +131,7 @@ object InstagramScraper {
             for ((method, post) in attempts) {
                 val p = post ?: continue
                 if (p.caption != null && caption == null) caption = p.caption
+                if (p.ogTitle != null && ogTitle == null) ogTitle = p.ogTitle
                 if (p.videoUrl != null && videoUrl == null) videoUrl = p.videoUrl
                 if (p.thumbnailUrl != null && thumbnailUrl == null) thumbnailUrl = p.thumbnailUrl
                 if (p.ownerUsername != null && ownerUsername == null) ownerUsername = p.ownerUsername
@@ -138,6 +147,7 @@ object InstagramScraper {
                 shortcode = shortcode,
                 type = if (videoUrl != null) "video" else "image",
                 caption = finalCaption,
+                ogTitle = ogTitle,
                 hashtags = extractHashtags(finalCaption ?: ""),
                 videoUrl = videoUrl,
                 thumbnailUrl = thumbnailUrl,
@@ -166,7 +176,108 @@ object InstagramScraper {
         null
     }
 
-    /* ---------------- Method 1: embed/captioned HTML ---------------- */
+    /* ---------------- Method 1: crawler post page (Googlebot UA) ---------------- */
+
+    /** Signed .mp4 URLs inside the page (JSON-escaped or HTML-escaped variants). */
+    private val mp4Regex = Regex("""https:(?:\\/\\/|//)[^"\s<>]+?\.mp4[^"\s<>]*""")
+
+    private fun fetchViaCrawler(shortcode: String): InstagramPost? = try {
+        val req = Request.Builder()
+            .url("https://www.instagram.com/p/$shortcode/")
+            .header("User-Agent", CRAWLER_UA)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return@use null
+            val html = resp.body?.string() ?: return@use null
+
+            val og = parseOgTags(html)
+            if (og.isEmpty()) return@use null
+
+            val rawDesc = og["description"]
+            val rawTitle = og["title"]
+            val caption = rawDesc?.let { captionFromOgDescription(it) }
+                ?: rawTitle?.let { captionFromOgTitle(it) }
+            val owner = rawDesc?.let { ownerFromOgDescription(it) }
+            val videoUrl = extractBestVideoUrl(html)
+            val thumbnailUrl = og["image"]
+
+            val cleanedCaption = caption?.let { cleanCaption(it) }?.takeIf { it.isNotBlank() }
+            if (cleanedCaption == null && videoUrl == null && thumbnailUrl == null) {
+                return@use null
+            }
+            InstagramPost(
+                shortcode = shortcode,
+                type = if (videoUrl != null) "video" else "image",
+                caption = cleanedCaption,
+                ogTitle = rawTitle,
+                hashtags = extractHashtags(cleanedCaption ?: ""),
+                videoUrl = videoUrl,
+                thumbnailUrl = thumbnailUrl,
+                ownerUsername = owner,
+                method = "crawler"
+            )
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** og: meta parsing supporting both attribute orders. */
+    private val ogRegexPropertyFirst =
+        Regex("""<meta[^>]+property=["']og:(title|description|image|video:secure_url|video:url|video)["'][^>]+content=["']([^"']*)["']""")
+    private val ogRegexContentFirst =
+        Regex("""<meta[^>]+content=["']([^"']*)["'][^>]+property=["']og:(title|description|image|video:secure_url|video:url|video)["']""")
+
+    private fun parseOgTags(html: String): Map<String, String> {
+        val og = mutableMapOf<String, String>()
+        for (m in ogRegexPropertyFirst.findAll(html)) {
+            val value = htmlDecode(m.groupValues[2])
+            if (value.isNotBlank() && !og.containsKey(m.groupValues[1])) og[m.groupValues[1]] = value
+        }
+        for (m in ogRegexContentFirst.findAll(html)) {
+            val value = htmlDecode(m.groupValues[1])
+            if (value.isNotBlank() && !og.containsKey(m.groupValues[2])) og[m.groupValues[2]] = value
+        }
+        return og
+    }
+
+    /** og:description looks like: "username on February 9, 2025: caption text". */
+    private val ogDescPrefixRegex =
+        Regex("""^[A-Za-z0-9._]+ on [A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*""")
+    private val ogOwnerRegex =
+        Regex("""^([A-Za-z0-9._]+) on [A-Za-z]+\s+\d{1,2},\s+\d{4}:""")
+
+    private fun captionFromOgDescription(desc: String): String? =
+        ogDescPrefixRegex.find(desc)?.let { desc.substring(it.value.length).trim().takeIf { s -> s.isNotEmpty() } }
+            ?: desc.trim().takeIf { it.isNotEmpty() }
+
+    private fun ownerFromOgDescription(desc: String): String? =
+        ogOwnerRegex.find(desc)?.groupValues?.get(1)?.takeIf { it.isNotBlank() && it != "Instagram" }
+
+    /** og:title looks like: "Account Name on Instagram: caption..." — used only as caption fallback. */
+    private val ogTitlePrefixRegex = Regex("""^[^:]*on Instagram:\s*""")
+
+    private fun captionFromOgTitle(title: String): String? =
+        ogTitlePrefixRegex.find(title)?.let { title.substring(it.value.length).trim().takeIf { s -> s.isNotEmpty() } }
+
+    /** Picks the working progressive video URL: prefer the one carrying `vs=` (full rendition). */
+    private fun extractBestVideoUrl(html: String): String? {
+        val urls = LinkedHashSet<String>()
+        for (m in mp4Regex.findAll(html)) {
+            val u = unescapeUrl(m.value)
+            if (u.startsWith("http")) urls.add(u)
+        }
+        if (urls.isEmpty()) return null
+        return urls.firstOrNull { it.contains("vs=") || it.contains("_nc_vs") }
+            ?: urls.maxByOrNull { it.length }
+    }
+
+    private fun unescapeUrl(raw: String): String = raw
+        .replace("\\/", "/")
+        .replace("\\u0026", "&")
+        .replace("&amp;", "&")
+
+    /* ---------------- Method 2: embed/captioned HTML (browser UA) ---------------- */
 
     private val videoUrlRegex = Regex("""\"video_url\":\"((?:[^"\\]|\\.)*)""")
     private val displayUrlRegex = Regex("""\"display_url\":\"((?:[^"\\]|\\.)*)""")
@@ -227,7 +338,7 @@ object InstagramScraper {
         null
     }
 
-    /* ---------------- Method 2: __a=1 JSON ---------------- */
+    /* ---------------- Method 3: __a=1 JSON ---------------- */
 
     private fun fetchViaApi(shortcode: String): InstagramPost? = try {
         val req = Request.Builder()
@@ -324,12 +435,7 @@ object InstagramScraper {
         null
     }
 
-    /* ---------------- Method 3: og: meta tags ---------------- */
-
-    private val ogRegexPropertyFirst =
-        Regex("""<meta[^>]+property=[\"']og:(title|description|image|video:secure_url|video:url|video)[\"'][^>]+content=[\"']([^\"']*)[\"']""")
-    private val ogRegexContentFirst =
-        Regex("""<meta[^>]+content=[\"']([^\"']*)[\"'][^>]+property=[\"']og:(title|description|image|video:secure_url|video:url|video)[\"']""")
+    /* ---------------- Method 4: og: meta tags (browser UA) ---------------- */
 
     private fun fetchViaOg(shortcode: String): InstagramPost? = try {
         val req = Request.Builder()
@@ -341,17 +447,7 @@ object InstagramScraper {
             if (!resp.isSuccessful) return@use null
             val html = resp.body?.string() ?: return@use null
 
-            val og = mutableMapOf<String, String>()
-            for (m in ogRegexPropertyFirst.findAll(html)) {
-                val key = m.groupValues[1]
-                val value = htmlDecode(m.groupValues[2])
-                if (value.isNotBlank() && !og.containsKey(key)) og[key] = value
-            }
-            for (m in ogRegexContentFirst.findAll(html)) {
-                val key = m.groupValues[2]
-                val value = htmlDecode(m.groupValues[1])
-                if (value.isNotBlank() && !og.containsKey(key)) og[key] = value
-            }
+            val og = parseOgTags(html)
             if (og.isEmpty()) return@use null
 
             val rawDescription = og["description"] ?: og["title"]
@@ -366,6 +462,7 @@ object InstagramScraper {
                 shortcode = shortcode,
                 type = if (videoUrl != null) "video" else "image",
                 caption = caption,
+                ogTitle = og["title"],
                 hashtags = emptyList(),
                 videoUrl = videoUrl,
                 thumbnailUrl = thumbnailUrl,
@@ -392,7 +489,7 @@ object InstagramScraper {
         return out
     }
 
-    /** Mirrors the backend caption cleaning. */
+    /** Mirrors smart-engine caption cleaning. */
     private fun cleanCaption(raw: String): String {
         var s = raw.trim()
         s = s.replace(Regex("^[\\w.\\-]+ on Instagram:\\s*"), "")
