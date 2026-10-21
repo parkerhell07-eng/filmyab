@@ -1,0 +1,36 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// History of movie identification requests
+model Identification {
+  id               String   @id @default(cuid())
+  instagramUrl     String?
+  note             String?
+  status           String // success | low_confidence | failed
+  movieName        String?
+  originalName     String?
+  year             String?
+  director         String?
+  genres           String? // JSON array of strings
+  confidence       Float?
+  reasoning        String?
+  posterUrl        String?
+  sources          String? // JSON array of {name,url}
+  candidates       String? // JSON array of {name,year,confidence}
+  caption          String?
+  sceneDescription String?
+  source           String? // link | screenshot
+  createdAt        DateTime @default(now())
+}
