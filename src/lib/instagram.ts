@@ -1,6 +1,6 @@
 /**
  * Instagram post scraper — multi-method chain.
- * Tries (in order): embed/captioned page, public __a=1 JSON, OG meta tags.
+ * Tries (in parallel): crawler-UA post page, embed/captioned page, public __a=1 JSON, OG meta tags.
  * No authentication required; degrades gracefully when Instagram blocks access.
  */
 
@@ -19,6 +19,10 @@ export interface InstagramPostData {
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/** Instagram serves full post content (og meta + signed mp4 URLs) to search crawlers. */
+const CRAWLER_UA =
+  "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
 
 const IG_APP_ID = "936619743392459";
 
@@ -122,6 +126,70 @@ function cleanCaption(text: string | null | undefined): string | null {
   t = t.replace(/^"(.*)"$/s, "$1");
   t = t.trim();
   return t.length > 0 ? t : null;
+}
+
+/* ---------------- Method 0: crawler-UA post page (works without login) ---------------- */
+
+const MP4_REGEX = /https:(?:\\\/\\\/|\/\/)[^"\s<>]+?\.mp4[^"\s<>]*/g;
+
+function unescapeUrl(raw: string): string {
+  return raw
+    .replace(/\\\//g, "/")
+    .replace(/\\u0026/g, "&")
+    .replace(/&amp;/g, "&");
+}
+
+function extractBestVideoUrl(html: string): string | null {
+  const urls = new Set<string>();
+  for (const m of html.matchAll(MP4_REGEX)) {
+    const u = unescapeUrl(m[0]);
+    if (u.startsWith("http")) urls.add(u);
+  }
+  if (urls.size === 0) return null;
+  const arr = [...urls];
+  return (
+    arr.find((u) => /[?&]vs=/.test(u) || u.includes("_nc_vs")) ??
+    arr.sort((a, b) => b.length - a.length)[0]
+  );
+}
+
+const OG_DESC_PREFIX = /^[\w.\-]+ on [A-Za-z]+\s+\d{1,2},\s+\d{4}:\s*/;
+const OG_OWNER = /^([\w.\-]+) on [A-Za-z]+\s+\d{1,2},\s+\d{4}:/;
+
+function ogMeta(html: string, prop: string): string | null {
+  const re = new RegExp(
+    `<meta[^>]+(?:property|name)=["']${prop}["'][^>]+content=["']([^"']*)["']`,
+    "i"
+  );
+  const re2 = new RegExp(
+    `<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']${prop}["']`,
+    "i"
+  );
+  const m = html.match(re) ?? html.match(re2);
+  return m ? decodeEntities(m[1]) : null;
+}
+
+async function fetchViaCrawler(shortcode: string): Promise<Partial<InstagramPostData> | null> {
+  const html = await fetchText(`https://www.instagram.com/p/${shortcode}/`, {
+    "User-Agent": CRAWLER_UA,
+  });
+  if (!html || html.length < 500) return null;
+
+  const title = ogMeta(html, "og:title");
+  const description = ogMeta(html, "og:description");
+  const ownerMatch = description?.match(OG_OWNER);
+  const caption = (description ?? title ?? null)?.replace(OG_DESC_PREFIX, "");
+
+  const out: Partial<InstagramPostData> = {
+    method: "crawler",
+    caption: cleanCaption(caption),
+    videoUrl: extractBestVideoUrl(html),
+    thumbnailUrl: ogMeta(html, "og:image"),
+    ownerUsername: ownerMatch ? ownerMatch[1] : null,
+  };
+  out.hashtags = extractHashtags(out.caption);
+  if (!out.caption && !out.videoUrl && !out.thumbnailUrl) return null;
+  return out;
 }
 
 /* ---------------- Method 1: embed/captioned page ---------------- */
@@ -340,6 +408,7 @@ export async function fetchInstagramPost(
   if (!parsed) return null;
 
   const results = await Promise.allSettled([
+    fetchViaCrawler(parsed.shortcode),
     fetchViaEmbed(parsed.shortcode),
     fetchViaApi(parsed.shortcode),
     fetchViaOg(parsed.shortcode),

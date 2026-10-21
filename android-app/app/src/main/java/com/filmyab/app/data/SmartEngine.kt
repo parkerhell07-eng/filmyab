@@ -9,7 +9,6 @@ import com.google.gson.JsonParser
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.arabic.ArabicTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
@@ -31,7 +30,7 @@ import java.util.concurrent.TimeUnit
  *  1. net     — automatic VPN/connectivity check (Instagram + internet reachability)
  *  2. fetch   — scrape the Instagram post on device (crawler-UA page, embed, __a=1, og)
  *  3. analyze — download the video to cache, sample 3 frames (MediaMetadataRetriever),
- *               read on-screen text with on-device OCR (ML Kit, latin + arabic)
+ *               read on-screen text with on-device OCR (ML Kit, bundled latin model)
  *  4. match   — keyless text LLM (Pollinations) turns caption/hashtags/OCR/og-title
  *               into ranked movie candidates
  *  5. verify  — each candidate is verified against Wikipedia REST (keyless): title,
@@ -285,35 +284,27 @@ object SmartEngine {
         }
     }
 
-    /** On-device OCR (latin + arabic models, bundled — no downloads). Returns merged unique lines. */
+    /** On-device OCR (bundled latin model — no downloads). Returns merged unique lines. */
     private suspend fun runOcr(frames: List<Bitmap>): String = withContext(Dispatchers.IO) {
         val latin = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        val arabic = TextRecognition.getClient(ArabicTextRecognizerOptions.Builder().build())
         val lines = LinkedHashSet<String>()
         try {
             for (bmp in frames) {
-                val recognizers = listOf(latin, arabic)
-                for (rec in recognizers) {
-                    try {
-                        val text: Text = rec.process(InputImage.fromBitmap(bmp, 0)).await()
-                        for (line in text.text.split("\n")) {
-                            val t = line.trim()
-                            if (t.length >= 2) {
-                                lines.add(t)
-                            }
+                try {
+                    val text: Text = latin.process(InputImage.fromBitmap(bmp, 0)).await()
+                    for (line in text.text.split("\n")) {
+                        val t = line.trim()
+                        if (t.length >= 2) {
+                            lines.add(t)
                         }
-                    } catch (e: Exception) {
-                        // OCR of this frame/model failed — keep going
                     }
+                } catch (e: Exception) {
+                    // OCR of this frame failed — keep going
                 }
             }
         } finally {
             try {
                 latin.close()
-            } catch (e: Exception) {
-            }
-            try {
-                arabic.close()
             } catch (e: Exception) {
             }
             frames.forEach { it.recycle() }
