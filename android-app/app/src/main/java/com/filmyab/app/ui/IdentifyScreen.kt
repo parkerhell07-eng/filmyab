@@ -119,8 +119,9 @@ fun IdentifyScreen(viewModel: MainViewModel) {
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                         trailingIcon = {
+                            val clipboardManager = LocalClipboardManager.current
                             IconButton(onClick = {
-                                val clipboardText = LocalClipboardManager.current.getText()?.text
+                                val clipboardText = clipboardManager.getText()?.text
                                 if (!clipboardText.isNullOrBlank()) {
                                     viewModel.setUrlInput(clipboardText.trim())
                                 }
