@@ -1,5 +1,6 @@
 // Faithful JS mirror of the NEW SmartEngine.kt logic (v2.1) — validates the fix
 // against the real APIs: rate-limit recovery + deterministic evidence path + verify.
+// Run: node tests/simulate-v2.1.mjs
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const WIKI_UA = "FilmYabEngine/2.1 (Android; movie identification; contact: filmyab.app)";
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -66,7 +67,7 @@ async function callLlm(system, user, maxRateLimitWaits = 2, totalBudgetMs = 1500
 const filmRe = /\b(film|movie|series|television|miniseries)\b/i;
 const yearRe = /(19|20)\d{2}/;
 // curl transport (sandbox: node-fetch TLS bucket is throttled; curl works — logic unchanged)
-const { execFileSync } = require("child_process");
+import { execFileSync } from "node:child_process";
 function curlJson(url) {
   const out = execFileSync("curl", ["-sS", "--max-time", "20", "-w", "\n%{http_code}", "-H", `User-Agent: ${WIKI_UA}`, "-H", "Accept: application/json", url], { encoding: "utf8" });
   const idx = out.lastIndexOf("\n");

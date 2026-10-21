@@ -1004,7 +1004,7 @@ export default function Home() {
       <footer className="mt-auto border-t border-border/60 glass-card pb-[env(safe-area-inset-bottom)]">
         <div className="mx-auto w-full max-w-lg px-4 py-4 text-center">
           <a
-            href="https://github.com/parkerhell07-eng/filmyab/releases/latest/download/FilmYab-v2.0-debug.apk"
+            href="https://github.com/parkerhell07-eng/filmyab/releases/latest/download/FilmYab-v2.1-debug.apk"
             target="_blank"
             rel="noopener noreferrer"
             className="mb-3 flex items-center justify-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs font-semibold text-amber-400 transition-colors hover:bg-amber-500/20"
