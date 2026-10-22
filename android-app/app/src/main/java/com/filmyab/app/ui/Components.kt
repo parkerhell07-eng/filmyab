@@ -25,9 +25,11 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -252,6 +254,34 @@ fun SmartResultCard(result: SmartResult, onRetry: () -> Unit) {
                             Text("کارگردان: $director", fontSize = 13.sp, color = OnSurfaceVariantDark)
                         }
                     }
+                    if (result.duration != null) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                Icons.Filled.Schedule,
+                                contentDescription = null,
+                                tint = DimText,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Text("مدت: ${result.duration}", fontSize = 13.sp, color = OnSurfaceVariantDark)
+                        }
+                    }
+                    if (result.country != null) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                Icons.Filled.Public,
+                                contentDescription = null,
+                                tint = DimText,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Text("کشور: ${result.country}", fontSize = 13.sp, color = OnSurfaceVariantDark)
+                        }
+                    }
                 }
             }
 
@@ -337,8 +367,33 @@ fun SmartResultCard(result: SmartResult, onRetry: () -> Unit) {
                 )
             }
 
-            if (result.wikiUrl != null || result.googleQuery != null) {
+            if (result.wikiUrl != null || result.googleQuery != null || result.imdbUrl != null) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (result.imdbUrl != null) {
+                        FilledTonalButton(
+                            onClick = {
+                                try {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(result.imdbUrl))
+                                    )
+                                } catch (e: Exception) {
+                                    // ignore malformed URLs
+                                }
+                            },
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = NavIndicator,
+                                contentColor = Accent
+                            )
+                        ) {
+                            Icon(
+                                Icons.Filled.Star,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text("IMDb", fontSize = 13.sp)
+                        }
+                    }
                     if (result.wikiUrl != null) {
                         FilledTonalButton(
                             onClick = {

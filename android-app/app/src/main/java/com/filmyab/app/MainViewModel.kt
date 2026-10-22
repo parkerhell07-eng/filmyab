@@ -8,6 +8,7 @@ import com.filmyab.app.data.HistoryStore
 import com.filmyab.app.data.InstagramScraper
 import com.filmyab.app.data.LocalHistoryItem
 import com.filmyab.app.data.NetState
+import com.filmyab.app.data.ResultCache
 import com.filmyab.app.data.SmartEngine
 import com.filmyab.app.data.SmartResult
 import com.filmyab.app.data.UpdateChecker
@@ -73,9 +74,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val LABEL_NET = "بررسی اتصال و فیلترشکن"
         private const val LABEL_FETCH = "خواندن پست از اینستاگرام"
         private const val LABEL_ANALYZE = "استخراج فریم و متن روی تصویر"
-        private const val LABEL_MATCH = "تحلیل هوشمند شواهد"
+        private const val LABEL_MATCH = "تحلیل هوشمند (هوش مصنوعی بینایی + وب + ویکی‌پدیا)"
         private const val LABEL_VERIFY = "تأیید با پایگاه فیلم"
-        private const val LABEL_FINAL = "تدوین نتیجه نهایی"
+        private const val LABEL_FINAL = "تدوین نتیجه و مشخصات کامل"
 
         private const val MSG_EMPTY_INPUT = "لینک اینستاگرام در کلیپ‌بورد نبود؛ لینک را بچسبانید یا کپی کنید."
         private const val MSG_NOT_IG_LINK =
@@ -255,6 +256,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = UiState.Error(MSG_NOT_IG_LINK)
             return
         }
+        // Speed win: the SAME link answered successfully within the last 7 days
+        // returns instantly from the on-device cache — no network, no waiting.
+        val cached = try {
+            ResultCache.get(getApplication(), url)
+        } catch (e: Exception) {
+            null
+        }
+        if (cached != null) {
+            _uiState.value = UiState.Success(cached.copy(instagramUrl = url))
+            return
+        }
         val steps = initialSteps()
         _uiState.value = UiState.Running(steps, steps.first().label)
 
@@ -269,6 +281,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val result = outcome.result.copy(instagramUrl = url)
                         _uiState.value = UiState.Success(result)
                         saveHistory(result)
+                        ResultCache.put(getApplication(), url, result)
                     }
                     is SmartEngine.Outcome.Fail -> {
                         _uiState.value = UiState.Error(outcome.message, outcome.needVpn)

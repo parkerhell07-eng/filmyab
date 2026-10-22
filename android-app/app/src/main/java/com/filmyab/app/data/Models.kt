@@ -1,7 +1,7 @@
 package com.filmyab.app.data
 
 /**
- * Data models of FilmYab v2 (fully on-device smart engine — no server).
+ * Data models of FilmYab (fully on-device smart engine — no server).
  * All JSON-facing fields are nullable (or defaulted) so Gson never crashes.
  */
 
@@ -32,7 +32,11 @@ data class SmartResult(
     val sceneSummary: String? = null,
     val evidenceSummary: String? = null,
     val instagramUrl: String? = null,
-    val sourceMode: String = "smart"
+    val sourceMode: String = "smart",
+    /* ---- v3.1 full-spec fields ---- */
+    val duration: String? = null,
+    val country: String? = null,
+    val imdbUrl: String? = null
 )
 
 /**
@@ -70,7 +74,11 @@ data class WikiEvidence(
     val pageUrl: String? = null,
     val posterUrl: String? = null,
     val faTitle: String? = null,
-    val isFilm: Boolean = false
+    val isFilm: Boolean = false,
+    /* ---- v3.1 full-spec fields (winner enrichment only) ---- */
+    val duration: String? = null,
+    val country: String? = null,
+    val imdbUrl: String? = null
 )
 
 /** A candidate after verification + scoring. */

@@ -35,7 +35,7 @@ object UpdateChecker {
 
     private const val REPO = "parkerhell07-eng/filmyab"
 
-    private const val UA = "FilmYab-Android/3.0"
+    private const val UA = "FilmYab-Android/3.1"
 
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
