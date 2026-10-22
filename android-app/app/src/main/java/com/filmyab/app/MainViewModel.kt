@@ -10,12 +10,17 @@ import com.filmyab.app.data.LocalHistoryItem
 import com.filmyab.app.data.NetState
 import com.filmyab.app.data.SmartEngine
 import com.filmyab.app.data.SmartResult
+import com.filmyab.app.data.UpdateChecker
+import com.filmyab.app.data.UpdateInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.File
 
 /** One engine step rendered in the running card. status: pending|start|done|skip|error */
 data class StepUi(
@@ -23,6 +28,15 @@ data class StepUi(
     val label: String,
     val status: String
 )
+
+/** In-app update state machine surfaced on the identify screen. */
+sealed interface UpdatePhase {
+    data object Idle : UpdatePhase
+    data class Available(val info: UpdateInfo) : UpdatePhase
+    data class Downloading(val progress: Int) : UpdatePhase
+    data class Ready(val info: UpdateInfo, val apk: File) : UpdatePhase
+    data class Failed(val message: String) : UpdatePhase
+}
 
 sealed interface UiState {
     data object Idle : UiState
@@ -80,9 +94,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _history = MutableStateFlow<List<LocalHistoryItem>>(historyStore.getAll())
     val history: StateFlow<List<LocalHistoryItem>> = _history.asStateFlow()
 
-    /** Hoisted so the text survives tab switches and resetToIdle. */
-    private val _urlInput = MutableStateFlow("")
-    val urlInput: StateFlow<String> = _urlInput.asStateFlow()
+    private val _updatePhase = MutableStateFlow<UpdatePhase>(UpdatePhase.Idle)
+    val updatePhase: StateFlow<UpdatePhase> = _updatePhase.asStateFlow()
+
+    private var identifyJob: Job? = null
+    private var lastUpdateInfo: UpdateInfo? = null
 
     private var lastAutoUrl: String = try {
         application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -91,8 +107,73 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ""
     }
 
+    /** Hoisted so the text survives tab switches and resetToIdle. */
+    private val _urlInput = MutableStateFlow("")
+    val urlInput: StateFlow<String> = _urlInput.asStateFlow()
+
     init {
         refreshNetwork()
+        checkForAppUpdate()
+    }
+
+    /* ---------------- in-app update ---------------- */
+
+    /** Silent, one-shot check against the public GitHub Releases (keyless). */
+    private fun checkForAppUpdate() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                delay(2500) // let the UI settle first
+                val app = getApplication<Application>()
+                val (code, name) = try {
+                    val info = app.packageManager.getPackageInfo(app.packageName, 0)
+                    Pair(info.longVersionCode, info.versionName ?: "")
+                } catch (e: Exception) {
+                    Pair(0L, "")
+                }
+                val update = UpdateChecker.checkLatest(code, name)
+                if (update != null && _updatePhase.value is UpdatePhase.Idle) {
+                    lastUpdateInfo = update
+                    _updatePhase.value = UpdatePhase.Available(update)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // update check is best-effort and silent
+            }
+        }
+    }
+
+    fun downloadUpdate() {
+        val info = (_updatePhase.value as? UpdatePhase.Available)?.info
+            ?: lastUpdateInfo
+            ?: return
+        lastUpdateInfo = info
+        _updatePhase.value = UpdatePhase.Downloading(0)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val apk = UpdateChecker.downloadApk(getApplication(), info.apkUrl) { pct ->
+                    _updatePhase.value = UpdatePhase.Downloading(pct)
+                }
+                _updatePhase.value = if (apk != null) {
+                    UpdatePhase.Ready(info, apk)
+                } else {
+                    UpdatePhase.Failed("دانلود به‌روزرسانی ناموفق بود — دوباره تلاش کن.")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _updatePhase.value = UpdatePhase.Failed("دانلود به‌روزرسانی ناموفق بود — دوباره تلاش کن.")
+            }
+        }
+    }
+
+    fun installUpdate() {
+        val ready = _updatePhase.value as? UpdatePhase.Ready ?: return
+        UpdateChecker.installApk(getApplication(), ready.apk)
+    }
+
+    fun dismissUpdate() {
+        _updatePhase.value = UpdatePhase.Idle
     }
 
     /* ---------------- connectivity ---------------- */
@@ -157,6 +238,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         identify(_urlInput.value)
     }
 
+    /** Stops the running engine at once (the user is never stuck waiting). */
+    fun cancelIdentify() {
+        identifyJob?.cancel()
+        identifyJob = null
+        _uiState.value = UiState.Idle
+    }
+
     private fun identify(rawUrl: String) {
         val url = rawUrl.trim()
         if (url.isEmpty()) {
@@ -170,7 +258,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val steps = initialSteps()
         _uiState.value = UiState.Running(steps, steps.first().label)
 
-        viewModelScope.launch(Dispatchers.IO) {
+        identifyJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 when (val outcome = SmartEngine.identify(
                     appContext = getApplication(),

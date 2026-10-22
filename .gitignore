@@ -58,3 +58,6 @@ db/*.db-journal
 worklog.md
 /download/
 /upload/
+tool-results/
+.zscripts/
+dev.log

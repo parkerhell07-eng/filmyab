@@ -273,6 +273,40 @@ fun SmartResultCard(result: SmartResult, onRetry: () -> Unit) {
                 }
             }
 
+            if (result.cast.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        "بازیگران",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = DimText
+                    )
+                    Text(
+                        result.cast.take(5).joinToString("، "),
+                        fontSize = 13.sp,
+                        color = OnSurfaceVariantDark,
+                        lineHeight = 20.sp
+                    )
+                }
+            }
+
+            if (!result.plot.isNullOrBlank()) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        "داستان",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = DimText
+                    )
+                    Text(
+                        result.plot ?: "",
+                        fontSize = 13.sp,
+                        color = OnSurfaceVariantDark,
+                        lineHeight = 21.sp
+                    )
+                }
+            }
+
             ConfidenceBar(result.confidence)
 
             if (result.status == "low_confidence") {

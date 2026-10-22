@@ -17,10 +17,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.Button
@@ -30,6 +33,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -49,6 +53,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.filmyab.app.MainViewModel
 import com.filmyab.app.UiState
+import com.filmyab.app.UpdatePhase
 import com.filmyab.app.data.NetState
 import com.filmyab.app.ui.theme.Accent
 import com.filmyab.app.ui.theme.BgDark
@@ -57,6 +62,7 @@ import com.filmyab.app.ui.theme.ErrorRed
 import com.filmyab.app.ui.theme.OnAccent
 import com.filmyab.app.ui.theme.OnBg
 import com.filmyab.app.ui.theme.OnSurfaceVariantDark
+import com.filmyab.app.ui.theme.NavIndicator
 import com.filmyab.app.ui.theme.StatusFail
 import com.filmyab.app.ui.theme.StatusLow
 import com.filmyab.app.ui.theme.StatusSuccess
@@ -68,6 +74,7 @@ fun IdentifyScreen(viewModel: MainViewModel) {
     val state = viewModel.uiState.collectAsState().value
     val net = viewModel.netState.collectAsState().value
     val urlText = viewModel.urlInput.collectAsState().value
+    val update = viewModel.updatePhase.collectAsState().value
 
     Column(
         modifier = Modifier
@@ -93,6 +100,14 @@ fun IdentifyScreen(viewModel: MainViewModel) {
 
         /* ---------- Auto VPN / connectivity banner ---------- */
         NetBanner(net = net, onRefresh = { viewModel.refreshNetwork() })
+
+        /* ---------- In-app update banner ---------- */
+        UpdateBanner(
+            phase = update,
+            onDownload = { viewModel.downloadUpdate() },
+            onInstall = { viewModel.installUpdate() },
+            onDismiss = { viewModel.dismissUpdate() }
+        )
 
         /* ---------- Input card ---------- */
         Card(
@@ -183,6 +198,19 @@ fun IdentifyScreen(viewModel: MainViewModel) {
                     if (running.currentLabel.isNotBlank()) {
                         Text(running.currentLabel, fontSize = 12.sp, color = DimText)
                     }
+                    TextButton(
+                        onClick = { viewModel.cancelIdentify() },
+                        modifier = Modifier.align(Alignment.End)
+                    ) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = null,
+                            tint = DimText,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("لغو", fontSize = 13.sp, color = DimText)
+                    }
                 }
             }
         }
@@ -219,7 +247,7 @@ fun IdentifyScreen(viewModel: MainViewModel) {
                     modifier = Modifier.size(16.dp)
                 )
                 Text(
-                    "نسخه ۲.۰ — بدون سرور و بدون هیچ تنظیماتی. موتور هوشمند روی دستگاه: متادیتای پست + فریم‌ها + متن روی تصویر + ویکی‌پدیا",
+                    "نسخه ۳.۰ — تحلیل چندکاناله: هوش مصنوعی آنلاین رایگان + جستجوی وب زنده + فریم‌ها و OCR + ویکی‌پدیا و ویکی‌داده — با آپدیت درون‌برنامه‌ای",
                     fontSize = 12.sp,
                     color = DimText
                 )
@@ -325,5 +353,172 @@ private fun ErrorCard(message: String, showVpnHint: Boolean) {
                 }
             }
         }
+    }
+}
+
+/** In-app update banner: available → downloading → ready to install / failed. */
+@Composable
+private fun UpdateBanner(
+    phase: UpdatePhase,
+    onDownload: () -> Unit,
+    onInstall: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    when (phase) {
+        is UpdatePhase.Available -> {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = StatusSuccess.copy(alpha = 0.12f),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.SystemUpdate,
+                        contentDescription = null,
+                        tint = StatusSuccess,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "نسخه جدید ${phase.info.versionName} منتشر شد",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = StatusSuccess
+                        )
+                        Text(
+                            "برای سرعت و دقت بهتر، به‌روزرسانی کن",
+                            fontSize = 12.sp,
+                            color = OnSurfaceVariantDark
+                        )
+                    }
+                    Button(
+                        onClick = onDownload,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = StatusSuccess,
+                            contentColor = BgDark
+                        ),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            horizontal = 12.dp, vertical = 6.dp
+                        )
+                    ) {
+                        Icon(
+                            Icons.Filled.Download,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("دانلود", fontSize = 12.sp)
+                    }
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(24.dp)) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "بستن",
+                            tint = DimText,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
+            }
+        }
+        is UpdatePhase.Downloading -> {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = SurfaceVariantDark,
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        "در حال دانلود به‌روزرسانی… ${phase.progress}٪",
+                        fontSize = 12.sp,
+                        color = OnSurfaceVariantDark
+                    )
+                    LinearProgressIndicator(
+                        progress = { phase.progress / 100f },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp),
+                        color = Accent,
+                        trackColor = NavIndicator
+                    )
+                }
+            }
+        }
+        is UpdatePhase.Ready -> {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = Accent.copy(alpha = 0.12f),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.SystemUpdate,
+                        contentDescription = null,
+                        tint = Accent,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        "نسخه ${phase.info.versionName} دانلود شد",
+                        fontSize = 13.sp,
+                        color = Accent,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = onInstall,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Accent,
+                            contentColor = OnAccent
+                        ),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            horizontal = 12.dp, vertical = 6.dp
+                        )
+                    ) {
+                        Text("نصب", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        is UpdatePhase.Failed -> {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = StatusFail.copy(alpha = 0.12f),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        phase.message,
+                        fontSize = 12.sp,
+                        color = StatusFail,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = onDownload) {
+                        Text("تلاش مجدد", fontSize = 12.sp, color = StatusFail)
+                    }
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(24.dp)) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "بستن",
+                            tint = DimText,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
+            }
+        }
+        UpdatePhase.Idle -> {}
     }
 }

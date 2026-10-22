@@ -21,6 +21,8 @@ data class SmartResult(
     val year: String? = null,
     val director: String? = null,
     val genres: List<String> = emptyList(),
+    val cast: List<String> = emptyList(),
+    val plot: String? = null,
     val confidence: Double = 0.0,
     val reasoningFa: String? = null,
     val posterUrl: String? = null,
@@ -56,12 +58,15 @@ data class InstagramPost(
     val method: String = ""
 )
 
-/** Wikipedia evidence attached to a verified candidate. */
+/** Wikipedia/Wikidata evidence attached to a verified candidate. */
 data class WikiEvidence(
     val pageTitle: String? = null,
     val pageDescription: String? = null,
     val year: String? = null,
     val director: String? = null,
+    val genres: List<String> = emptyList(),
+    val cast: List<String> = emptyList(),
+    val plot: String? = null,
     val pageUrl: String? = null,
     val posterUrl: String? = null,
     val faTitle: String? = null,
