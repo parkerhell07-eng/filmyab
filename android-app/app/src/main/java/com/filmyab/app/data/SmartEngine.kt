@@ -23,6 +23,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.coroutineContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -671,7 +672,7 @@ object SmartEngine {
             "certainty for each candidate; year=\"\" if unsure; " +
             "if the evidence is too weak to name any movie, set found=false and candidates=[]."
 
-    private fun askLlmCandidates(
+    private suspend fun askLlmCandidates(
         post: InstagramPost,
         ocrText: String,
         web: List<WebHit>
@@ -1253,11 +1254,11 @@ object SmartEngine {
             val labelsRoot: JsonObject = getJson(labelsUrl, WIKI_UA) ?: return null
             val labelEntities = labelsRoot.getAsJsonObject("entities") ?: return null
 
-            val labelOf = { id: String ->
-                val ent = labelEntities.getAsJsonObject(id) ?: return@labelOf null
-                val labels = ent.getAsJsonObject("labels") ?: return@labelOf null
+            fun labelOf(id: String): String? {
+                val ent = labelEntities.getAsJsonObject(id) ?: return null
+                val labels = ent.getAsJsonObject("labels") ?: return null
                 val fa = labels.getAsJsonObject("fa")?.optStringSafe("value")
-                (fa ?: labels.getAsJsonObject("en")?.optStringSafe("value"))
+                return fa ?: labels.getAsJsonObject("en")?.optStringSafe("value")
             }
 
             val director = directorIds.firstNotNullOfOrNull { id -> labelOf(id) }

@@ -3,6 +3,7 @@ package com.filmyab.app.data
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.FileProvider
+import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -10,6 +11,16 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.util.concurrent.TimeUnit
+
+/**
+ * One newer release advertised by GitHub; produced by [UpdateChecker.checkLatest].
+ */
+data class UpdateInfo(
+    val versionName: String,
+    val versionCode: Long,
+    val apkUrl: String,
+    val notes: String?
+)
 
 /**
  * In-app update: checks the app's public GitHub Releases (keyless) and, when a
@@ -21,13 +32,6 @@ import java.util.concurrent.TimeUnit
  * against the installed versionName as a fallback.
  */
 object UpdateChecker {
-
-    data class UpdateInfo(
-        val versionName: String,
-        val versionCode: Long,
-        val apkUrl: String,
-        val notes: String?
-    )
 
     private const val REPO = "parkerhell07-eng/filmyab"
 
